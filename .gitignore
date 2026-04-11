@@ -147,3 +147,14 @@ xyz/
 **/exp/**
 **/ckpts/**
 ckpts
+
+# data set
+Dataset_Root/
+# Ignore all image files everywhere
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
