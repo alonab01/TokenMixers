@@ -1,18 +1,18 @@
-"""QuantConv2d — wraps nn.Conv2d with weight + input-activation fake-quantization.
+"""QuantConv2d — wraps nn.Conv2d with weight-only fake-quantization.
 
 Weights: observed + frozen once in __init__ (static, no data needed).
-Activations: observer starts DISABLED; convert.py + calibrate.py drive it to CALIBRATING then FROZEN.
-Bias: stays FP32 (standard fake-quant convention).
+Activations: NOT quantized here. Activation quantization is handled exclusively
+by PreStubbedModule stubs placed at block inputs (hardware memory-read model).
+Bias stays FP32 (standard fake-quant convention).
 """
 from __future__ import annotations
 
 from typing import Optional
 
-import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from quantization.observer import DISABLED, BaseObserver, build_observer
+from quantization.observer import BaseObserver, build_observer
 
 
 class QuantConv2d(nn.Module):
@@ -26,11 +26,8 @@ class QuantConv2d(nn.Module):
         groups: int,
         padding_mode: str,
         weight_bits: int,
-        act_bits: int,
         weight_observer: str = "min_max",
-        act_observer: str = "min_max",
         weight_scheme: str = "symmetric",
-        act_scheme: str = "asymmetric",
     ):
         super().__init__()
         self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
@@ -44,21 +41,13 @@ class QuantConv2d(nn.Module):
         self.dilation = dilation
         self.groups = groups
         self.padding_mode = padding_mode
-
         self.weight_bits = weight_bits
-        self.act_bits = act_bits
 
-        # Weight observer: observe-then-freeze immediately (weights are static).
         self.weight_observer: BaseObserver = build_observer(
             weight_observer, bits=weight_bits, scheme=weight_scheme
         )
         self.weight_observer.observe(self.weight)
         self.weight_observer.freeze()
-
-        # Activation observer: starts DISABLED. calibrate.py drives it.
-        self.act_observer: BaseObserver = build_observer(
-            act_observer, bits=act_bits, scheme=act_scheme
-        )
 
     @classmethod
     def from_conv2d(cls, conv: nn.Conv2d, **quant_cfg) -> "QuantConv2d":
@@ -75,20 +64,15 @@ class QuantConv2d(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        x_q = self.act_observer(x)
         w_q = self.weight_observer.fake_quantize(self.weight)
         if self.padding_mode != "zeros":
-            x_q = F.pad(
-                x_q,
-                self._reversed_padding_repeated_twice(),
-                mode=self.padding_mode,
-            )
+            x = F.pad(x, self._reversed_padding_repeated_twice(), mode=self.padding_mode)
             return F.conv2d(
-                x_q, w_q, self.bias,
+                x, w_q, self.bias,
                 self.stride, (0, 0), self.dilation, self.groups,
             )
         return F.conv2d(
-            x_q, w_q, self.bias,
+            x, w_q, self.bias,
             self.stride, self.padding, self.dilation, self.groups,
         )
 
@@ -102,5 +86,5 @@ class QuantConv2d(nn.Module):
         return (
             f"in={self.weight.shape[1] * self.groups}, out={self.weight.shape[0]}, "
             f"k={tuple(self.weight.shape[-2:])}, stride={self.stride}, "
-            f"groups={self.groups}, w_bits={self.weight_bits}, a_bits={self.act_bits}"
+            f"groups={self.groups}, w_bits={self.weight_bits}"
         )

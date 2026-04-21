@@ -39,11 +39,12 @@ class QuantStub(nn.Module):
         return f"a_bits={self.act_bits}, observer={type(self.act_observer).__name__}"
 
 
-class StubbedModule(nn.Module):
-    """Wraps an inner module and applies a QuantStub to its output.
+class PreStubbedModule(nn.Module):
+    """Wraps an inner module and quantizes its INPUT before passing in.
 
-    Used by convert.py to post-quantize block outputs without editing AFFNet source.
-    The wrapping is opaque: same input/output tensor signature as `inner`.
+    Models the int8 memory read at the start of a hardware fused kernel.
+    The inner module runs on a quantized input; its internal activations stay
+    FP32 (no intermediate memory writes inside a fused kernel).
     """
 
     def __init__(self, inner: nn.Module, stub: QuantStub):
@@ -52,8 +53,8 @@ class StubbedModule(nn.Module):
         self.stub = stub
 
     def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
-        y = self.inner(x, *args, **kwargs)
-        return self.stub(y)
+        x_q = self.stub(x)
+        return self.inner(x_q, *args, **kwargs)
 
     def extra_repr(self) -> str:
-        return f"stubbed={type(self.inner).__name__}"
+        return f"pre_stubbed={type(self.inner).__name__}"

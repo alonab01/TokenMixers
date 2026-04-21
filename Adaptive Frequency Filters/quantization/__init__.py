@@ -8,11 +8,11 @@ See CLAUDE.md Quantization section.
 """
 from quantization.quant_conv import QuantConv2d
 from quantization.quant_linear import QuantLinear
-from quantization.quant_stub import QuantStub, StubbedModule
+from quantization.quant_stub import QuantStub, PreStubbedModule
 
 __all__ = [
     "QuantConv2d",
     "QuantLinear",
     "QuantStub",
-    "StubbedModule",
+    "PreStubbedModule",
 ]
