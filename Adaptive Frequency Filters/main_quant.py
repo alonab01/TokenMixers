@@ -31,6 +31,7 @@ from utils.common_utils import create_directories, device_setup, move_to_device
 from utils.ddp_utils import distributed_init, is_master
 from utils.tensor_utils import image_size_from_opts
 
+from quantization.bias_correction import apply_bias_correction
 from quantization.calibrate import calibrate
 from quantization.convert import (
     collect_quant_convs,
@@ -39,6 +40,84 @@ from quantization.convert import (
     collect_quant_stubs,
     convert_model,
 )
+from quantization.fuse import fold_conv_bn_
+from quantization.quant_stub import StubConfig
+
+from typing import Dict, Type
+import importlib
+
+# Phase 5: registry of stub target classes addressable by short name.
+# String form "module:Class" is resolved lazily so we don't import affnet
+# modules at script import time (avoids circular-ish risks).
+_STUB_TARGET_REGISTRY: Dict[str, str] = {
+    "ln2d":     "affnet.layers.normalization.layer_norm:LayerNorm2D_NCHW",
+    "afno2d":   "affnet.modules.aff_block:AFNO2D_channelfirst",
+    "block":    "affnet.modules.aff_block:Block",
+    "affblock": "affnet.modules.aff_block:AFFBlock",
+}
+
+
+def _resolve_target(name: str) -> Type:
+    spec = _STUB_TARGET_REGISTRY[name]
+    mod_name, cls_name = spec.split(":")
+    return getattr(importlib.import_module(mod_name), cls_name)
+
+
+def _build_stub_targets(target_csv: str, cfg: StubConfig) -> Dict[Type, StubConfig]:
+    """Build a {nn.Module subclass: StubConfig} dict from a comma-separated short-name list.
+
+    All targets share the same `cfg`. For per-target overrides, use
+    `_build_stub_targets_from_config`.
+    """
+    if not target_csv.strip():
+        return {}
+    out: Dict[Type, StubConfig] = {}
+    for name in [t.strip() for t in target_csv.split(",") if t.strip()]:
+        if name not in _STUB_TARGET_REGISTRY:
+            raise ValueError(
+                f"unknown --quant.stub-targets entry '{name}'; "
+                f"valid: {sorted(_STUB_TARGET_REGISTRY)}"
+            )
+        out[_resolve_target(name)] = cfg
+    return out
+
+
+def _build_stub_targets_from_config(
+    config_csv: str,
+    default_cfg: StubConfig,
+) -> Dict[Type, StubConfig]:
+    """Parse `--quant.stub-config` per-target override format.
+
+    Format: 'name=observer[:bits[:scheme]],...'
+    Examples:
+        'ln2d=min_max'                                       (observer override only)
+        'ln2d=min_max,afno2d=percentile'
+        'ln2d=min_max:8:asymmetric,afno2d=histogram:8:asymmetric'
+
+    Bits/scheme default to `default_cfg`'s values when omitted. Empty input -> {}.
+    """
+    if not config_csv.strip():
+        return {}
+    out: Dict[Type, StubConfig] = {}
+    for entry in [t.strip() for t in config_csv.split(",") if t.strip()]:
+        if "=" not in entry:
+            raise ValueError(
+                f"--quant.stub-config entry '{entry}' missing '='; "
+                f"format: 'name=observer[:bits[:scheme]]'"
+            )
+        name, spec = entry.split("=", 1)
+        name = name.strip()
+        if name not in _STUB_TARGET_REGISTRY:
+            raise ValueError(
+                f"unknown stub-config target '{name}'; "
+                f"valid: {sorted(_STUB_TARGET_REGISTRY)}"
+            )
+        parts = spec.split(":")
+        observer = parts[0].strip() or default_cfg.observer
+        bits = int(parts[1]) if len(parts) > 1 and parts[1].strip() else default_cfg.bits
+        scheme = parts[2].strip() if len(parts) > 2 and parts[2].strip() else default_cfg.scheme
+        out[_resolve_target(name)] = StubConfig(bits=bits, observer=observer, scheme=scheme)
+    return out
 
 
 class _TupleIndexAdapter(Dataset):
@@ -150,17 +229,32 @@ def main(opts, **kwargs):
     model = model.to(device=device, memory_format=memory_format)
     model.eval()
 
+    # ---- (optional) fold Conv+BN ---- #
+    # Done before the --quant.enabled gate so plain FP32 eval can be A/B tested
+    # against itself (with vs. without folding).
+    fold_bn = bool(getattr(opts, "quant.fold_bn", False))
+    n_bn_fused = 0
+    if fold_bn:
+        n_bn_fused = fold_conv_bn_(model)
+        if is_master_node:
+            logger.log(f"[quant] Folded {n_bn_fused} Conv+BN pairs into Conv weights/bias")
+
     if not getattr(opts, "quant.enabled", False):
-        logger.warning(
-            "--quant.enabled was not set. Running plain FP32 eval (equivalent to main_eval.py)."
-        )
+        if not fold_bn:
+            logger.warning(
+                "--quant.enabled was not set. Running plain FP32 eval (equivalent to main_eval.py)."
+            )
+        else:
+            logger.log(
+                "--quant.enabled was not set; running plain FP32 eval on the BN-folded model."
+            )
         Evaluator(opts=opts, model=model, eval_loader=val_loader).run()
         return
 
     # ---- convert ---- #
     w_bits = getattr(opts, "quant.weight_bits", 8)
     a_bits = getattr(opts, "quant.activation_bits", 8)
-    skip_str = getattr(opts, "quant.skip_modules", "conv_1")
+    skip_str = getattr(opts, "quant.skip_modules", "")
     skip_list = [s.strip() for s in skip_str.split(",") if s.strip()]
 
     quantize_linear = bool(getattr(opts, "quant.quantize_linear", False))
@@ -173,6 +267,24 @@ def main(opts, **kwargs):
     stub_scheme = getattr(opts, "quant.stub_scheme", "asymmetric")
     stub_bits_arg = int(getattr(opts, "quant.stub_bits", -1))
     stub_bits = stub_bits_arg if stub_bits_arg > 0 else a_bits
+    stub_targets_csv = getattr(opts, "quant.stub_targets", "")
+    stub_config_csv = getattr(opts, "quant.stub_config", "")
+    default_stub_cfg = StubConfig(bits=stub_bits, observer=stub_observer, scheme=stub_scheme)
+    if insert_stubs:
+        if stub_config_csv.strip():
+            # Per-target overrides take precedence; --quant.stub-targets is ignored
+            # to avoid the ambiguity of "what does the homogeneous one mean too?".
+            stub_target_configs = _build_stub_targets_from_config(
+                stub_config_csv, default_stub_cfg
+            )
+            if stub_targets_csv.strip():
+                logger.warning(
+                    "[quant] --quant.stub-config provided; --quant.stub-targets is ignored."
+                )
+        else:
+            stub_target_configs = _build_stub_targets(stub_targets_csv, default_stub_cfg)
+    else:
+        stub_target_configs = {}
 
     if is_master_node:
         logger.log(
@@ -182,6 +294,16 @@ def main(opts, **kwargs):
                 stub_bits, stub_observer,
             )
         )
+        if stub_config_csv.strip():
+            logger.log(
+                f"[quant] stub-config = '{stub_config_csv}' "
+                f"({len(stub_target_configs)} type(s) resolved, per-target observers)"
+            )
+        else:
+            logger.log(
+                f"[quant] stub targets = '{stub_targets_csv}' "
+                f"({len(stub_target_configs)} type(s) resolved)"
+            )
     convert_model(
         model,
         weight_bits=w_bits,
@@ -195,6 +317,7 @@ def main(opts, **kwargs):
         skip_linears=skip_linears,
         insert_stubs=insert_stubs,
         skip_stubs=skip_stubs,
+        stub_target_configs=stub_target_configs if stub_target_configs else None,
         stub_bits=stub_bits,
         stub_observer=stub_observer,
         stub_scheme=stub_scheme,
@@ -236,6 +359,24 @@ def main(opts, **kwargs):
     )
     if is_master_node:
         logger.log(f"[quant] Calibration done in {time.time() - t0:.1f}s")
+
+    # ---- (optional) bias correction ---- #
+    bias_correction = bool(getattr(opts, "quant.bias_correction", False))
+    if bias_correction:
+        # Use a fresh loader so we get a deterministic pass with the same calibration set.
+        bc_loader = _build_calib_loader(opts=opts, batch_size=calib_bs, seed=calib_seed)
+        t0 = time.time()
+        n_corrected = apply_bias_correction(
+            model=model,
+            batches=bc_loader,
+            n_batches=n_cal_batches,
+            input_fn=_extract,
+        )
+        if is_master_node:
+            logger.log(
+                f"[quant] Bias correction applied to {n_corrected} modules "
+                f"in {time.time() - t0:.1f}s"
+            )
 
     # ---- diagnostic: dump observer stats ---- #
     if is_master_node:
@@ -314,6 +455,11 @@ def main(opts, **kwargs):
             "a_scheme": getattr(opts, "quant.act_scheme", "asymmetric"),
             "quantize_linear": quantize_linear,
             "insert_stubs": insert_stubs,
+            "stub_targets": stub_targets_csv if insert_stubs else "",
+            "stub_config": stub_config_csv if insert_stubs else "",
+            "bias_correction": bias_correction,
+            "fold_bn": fold_bn,
+            "n_bn_fused": n_bn_fused,
             "n_quant_convs": n_qconvs,
             "n_quant_linears": n_qlinears,
             "n_quant_stubs": n_qstubs,

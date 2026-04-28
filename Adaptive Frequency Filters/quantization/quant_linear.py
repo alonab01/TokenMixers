@@ -1,8 +1,7 @@
-"""QuantLinear — wraps nn.Linear / AFFNet LinearLayer with weight-only fake-quantization.
+"""QuantLinear — wraps nn.Linear / AFFNet LinearLayer with weight + activation fake-quantization.
 
-Mirrors QuantConv2d: weight observer runs observe+freeze once in __init__.
-Activations: NOT quantized here. Handled exclusively by PreStubbedModule stubs.
-Bias stays FP32.
+Mirrors QuantConv2d: weight observer runs observe+freeze once in __init__, and an
+own act_observer quantizes the input in forward. Bias stays FP32.
 
 Weight shape is (out_features, in_features); per_channel_min_max with axis=0 matches
 exactly (each output feature gets its own scale), so no extra reshape logic is needed.
@@ -25,6 +24,9 @@ class QuantLinear(nn.Module):
         weight_bits: int,
         weight_observer: str = "min_max",
         weight_scheme: str = "symmetric",
+        act_bits: int = 8,
+        act_observer: str = "min_max",
+        act_scheme: str = "asymmetric",
     ):
         super().__init__()
         self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
@@ -35,12 +37,17 @@ class QuantLinear(nn.Module):
 
         self.out_features, self.in_features = self.weight.shape
         self.weight_bits = weight_bits
+        self.act_bits = act_bits
 
         self.weight_observer: BaseObserver = build_observer(
             weight_observer, bits=weight_bits, scheme=weight_scheme
         )
         self.weight_observer.observe(self.weight)
         self.weight_observer.freeze()
+
+        self.act_observer: BaseObserver = build_observer(
+            act_observer, bits=act_bits, scheme=act_scheme
+        )
 
     @classmethod
     def from_linear(cls, linear: nn.Module, **quant_cfg) -> "QuantLinear":
@@ -59,11 +66,12 @@ class QuantLinear(nn.Module):
         return cls(weight=w, bias=b, **quant_cfg)
 
     def forward(self, x: Tensor) -> Tensor:
+        x = self.act_observer(x)
         w_q = self.weight_observer.fake_quantize(self.weight)
         return F.linear(x, w_q, self.bias)
 
     def extra_repr(self) -> str:
         return (
             f"in={self.in_features}, out={self.out_features}, "
-            f"w_bits={self.weight_bits}"
+            f"w_bits={self.weight_bits}, a_bits={self.act_bits}"
         )

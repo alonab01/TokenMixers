@@ -11,8 +11,11 @@ from quantization.observer import (
     OBSERVER_REGISTRY,
     SYMMETRIC,
     BaseObserver,
+    HistogramObserver,
     MinMaxObserver,
+    MSEObserver,
     PerChannelMinMaxObserver,
+    PerChannelMSEObserver,
     PercentileObserver,
     build_observer,
     register_observer,
@@ -319,3 +322,185 @@ def test_buffers_move_with_module():
     assert int(obs2.mode.item()) == FROZEN
     x = torch.tensor([0.5, 1.5])
     assert torch.equal(obs(x), obs2(x))
+
+
+# ---------------------------------------------------------------- #
+# Phase 6: MSE observers
+# ---------------------------------------------------------------- #
+
+
+def test_mse_registered():
+    assert "mse" in OBSERVER_REGISTRY
+    assert "per_channel_mse" in OBSERVER_REGISTRY
+
+
+def test_mse_rejects_asymmetric():
+    with pytest.raises(ValueError, match="symmetric"):
+        MSEObserver(bits=8, scheme=ASYMMETRIC)
+    with pytest.raises(ValueError, match="symmetric"):
+        PerChannelMSEObserver(bits=8, scheme=ASYMMETRIC)
+
+
+def test_mse_observer_workflow():
+    """observe() produces a frozen-ready scale; freeze() flips mode."""
+    obs = MSEObserver(bits=4, scheme=SYMMETRIC)
+    w = torch.randn(64) * 0.5
+    w[0] = 5.0  # outlier
+    obs.observe(w)
+    obs.freeze()
+    assert int(obs.mode.item()) == FROZEN
+    # forward applies fake-quant
+    y = obs(w)
+    assert y.shape == w.shape
+    # 4-bit symmetric -> at most 15 distinct quantized values
+    assert torch.unique(y).numel() <= 15
+
+
+def test_mse_picks_smaller_scale_than_minmax_with_outlier():
+    """The whole point: MSE scale < max(|W|)/qmax when the tensor has an outlier."""
+    torch.manual_seed(7)
+    w = torch.randn(1000) * 0.3
+    w[0] = 10.0  # one outlier, 30 sigma
+
+    mm = MinMaxObserver(bits=4, scheme=SYMMETRIC)
+    mm.observe(w)
+    mm.freeze()
+
+    mse = MSEObserver(bits=4, scheme=SYMMETRIC)
+    mse.observe(w)
+    mse.freeze()
+
+    # MSE scale should be strictly smaller than min/max scale.
+    assert mse.scale.item() < mm.scale.item()
+    # And the resulting quantization error on typical (non-outlier) values
+    # should be smaller too.
+    typical = w[1:]
+    err_mm = (typical - mm(typical)).pow(2).mean().item()
+    err_mse = (typical - mse(typical)).pow(2).mean().item()
+    assert err_mse < err_mm
+
+
+def test_per_channel_mse_scale_shape():
+    obs = PerChannelMSEObserver(bits=4, scheme=SYMMETRIC, axis=0)
+    w = torch.randn(8, 16, 3, 3)
+    obs.observe(w)
+    obs.freeze()
+    assert obs.scale.shape == (8,)
+
+
+def test_per_channel_mse_beats_per_channel_minmax_on_depthwise_with_outliers():
+    """Per-channel MSE should be at least as good as per-channel min/max for depthwise
+    weights with channel-wise outliers."""
+    torch.manual_seed(11)
+    n_out = 16
+    w = torch.randn(n_out, 1, 3, 3) * 0.2
+    # inject one large outlier per channel
+    for c in range(n_out):
+        w[c, 0, 0, 0] = 5.0 * (1 + c % 3)  # heterogeneous outliers
+
+    pc_mm = PerChannelMinMaxObserver(bits=4, scheme=SYMMETRIC)
+    pc_mm.observe(w)
+    pc_mm.freeze()
+    err_mm = (w - pc_mm(w)).pow(2).mean().item()
+
+    pc_mse = PerChannelMSEObserver(bits=4, scheme=SYMMETRIC)
+    pc_mse.observe(w)
+    pc_mse.freeze()
+    err_mse = (w - pc_mse(w)).pow(2).mean().item()
+
+    # MSE should be strictly better, or at worst equal (if init scale already optimal).
+    assert err_mse <= err_mm * 1.0001, f"MSE worse than min/max: {err_mse} vs {err_mm}"
+
+
+def test_mse_build_via_registry():
+    obs = build_observer("mse", bits=4, scheme=SYMMETRIC)
+    assert isinstance(obs, MSEObserver)
+    obs.observe(torch.randn(50))
+    obs.freeze()
+    assert int(obs.mode.item()) == FROZEN
+
+    obs2 = build_observer("per_channel_mse", bits=4, scheme=SYMMETRIC)
+    assert isinstance(obs2, PerChannelMSEObserver)
+    obs2.observe(torch.randn(8, 16, 3, 3))
+    obs2.freeze()
+    assert int(obs2.mode.item()) == FROZEN
+
+
+def test_mse_freeze_without_observe_raises():
+    obs = MSEObserver(bits=8, scheme=SYMMETRIC)
+    with pytest.raises(RuntimeError, match="no data observed"):
+        obs.freeze()
+    obs2 = PerChannelMSEObserver(bits=8, scheme=SYMMETRIC)
+    with pytest.raises(RuntimeError, match="no data observed"):
+        obs2.freeze()
+
+
+# ---------------------------------------------------------------- #
+# Phase 6b: Histogram + KL observer
+# ---------------------------------------------------------------- #
+
+
+def test_histogram_registered():
+    assert "histogram" in OBSERVER_REGISTRY
+
+
+def test_histogram_freeze_without_observe_raises():
+    obs = HistogramObserver(bits=8, scheme=ASYMMETRIC, n_bins=256)
+    with pytest.raises(RuntimeError, match="no data observed"):
+        obs.freeze()
+
+
+def test_histogram_basic_workflow_asymmetric():
+    obs = HistogramObserver(bits=4, scheme=ASYMMETRIC, n_bins=256)
+    obs.set_mode(CALIBRATING)
+    for _ in range(3):
+        obs(torch.randn(1000) * 0.5 + 1.0)
+    obs.freeze()
+    assert int(obs.mode.item()) == FROZEN
+    y = obs(torch.randn(100) * 0.5 + 1.0)
+    # 4-bit asymmetric -> at most 16 distinct values
+    assert torch.unique(y).numel() <= 16
+
+
+def test_histogram_basic_workflow_symmetric():
+    obs = HistogramObserver(bits=4, scheme=SYMMETRIC, n_bins=256)
+    obs.set_mode(CALIBRATING)
+    for _ in range(3):
+        obs(torch.randn(1000))
+    obs.freeze()
+    assert int(obs.mode.item()) == FROZEN
+    y = obs(torch.randn(100))
+    # 4-bit symmetric -> at most 15 distinct values (zero + 7 each sign)
+    assert torch.unique(y).numel() <= 15
+
+
+def test_histogram_picks_clip_smaller_than_max_with_outliers():
+    """KL search should clip the outlier tail when most mass is concentrated."""
+    torch.manual_seed(123)
+    obs_kl = HistogramObserver(bits=4, scheme=SYMMETRIC, n_bins=512)
+    obs_mm = MinMaxObserver(bits=4, scheme=SYMMETRIC)
+
+    # 99% gaussian, 1% outliers
+    for _ in range(5):
+        x = torch.randn(2000) * 0.3
+        x[:20] = 5.0  # outliers
+        obs_kl.set_mode(CALIBRATING)
+        obs_kl(x)
+        obs_mm.set_mode(CALIBRATING)
+        obs_mm(x)
+    obs_kl.freeze()
+    obs_mm.freeze()
+
+    # KL-based scale should be smaller than min/max-based (which uses the full max)
+    assert obs_kl.scale.item() < obs_mm.scale.item(), (
+        f"KL scale {obs_kl.scale.item()} should be < min/max scale {obs_mm.scale.item()}"
+    )
+
+
+def test_histogram_build_via_registry():
+    obs = build_observer("histogram", bits=8, scheme=ASYMMETRIC)
+    assert isinstance(obs, HistogramObserver)
+    obs.set_mode(CALIBRATING)
+    obs(torch.randn(500))
+    obs.freeze()
+    assert int(obs.mode.item()) == FROZEN

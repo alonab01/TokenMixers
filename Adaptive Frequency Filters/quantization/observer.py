@@ -299,3 +299,713 @@ class PerChannelMinMaxObserver(BaseObserver):
             return fake_quantize_symmetric(x, scale_b, self.qmin, self.qmax)
         zp_b = self._reshape_for_broadcast(self.zero_point, x)
         return fake_quantize_asymmetric(x, scale_b, zp_b, self.qmin, self.qmax)
+
+
+# ----------------------------------------------------------------------------
+# Phase 6: MSE-based scale search (for weights, both per-tensor and per-channel)
+# ----------------------------------------------------------------------------
+
+
+def _search_mse_scale_symmetric(
+    x: Tensor,
+    qmin: int,
+    qmax: int,
+    n_steps: int = 80,
+    p_min: float = 0.5,
+    p_max: float = 1.2,
+) -> Tensor:
+    """Brute-force per-tensor scale that minimizes MSE between x and fakeQ(x).
+
+    Initial scale = max(|x|)/qmax (the min/max answer). Candidate scales sweep
+    [p_min, p_max] * scale_init. Picks the candidate with lowest mean squared
+    quantization error.
+    """
+    max_abs = x.detach().abs().max()
+    init = compute_scale_symmetric(max_abs, qmax)
+    if not torch.isfinite(init) or init.item() <= 0:
+        return init
+    alphas = torch.linspace(p_min, p_max, n_steps, device=x.device, dtype=x.dtype)
+    best_scale = init.clone()
+    best_err = torch.tensor(float("inf"), device=x.device, dtype=x.dtype)
+    for a in alphas:
+        s = init * a
+        x_q = fake_quantize_symmetric(x, s, qmin, qmax)
+        err = (x - x_q).pow(2).mean()
+        if err < best_err:
+            best_err = err
+            best_scale = s
+    return best_scale
+
+
+def _search_mse_scale_per_channel_symmetric(
+    x: Tensor,
+    qmin: int,
+    qmax: int,
+    axis: int = 0,
+    n_steps: int = 80,
+    p_min: float = 0.5,
+    p_max: float = 1.2,
+) -> Tensor:
+    """Per-channel MSE scale. Returns shape (n_channels,)."""
+    n_channels = x.shape[axis]
+    # Flatten everything except `axis` so we can mean-reduce per channel.
+    perm = [axis] + [d for d in range(x.dim()) if d != axis]
+    x_perm = x.permute(perm).contiguous().view(n_channels, -1)
+    max_abs = x_perm.detach().abs().amax(dim=1)
+    init = compute_scale_symmetric(max_abs, qmax)
+    alphas = torch.linspace(p_min, p_max, n_steps, device=x.device, dtype=x.dtype)
+    best_scale = init.clone()
+    best_err = torch.full_like(init, float("inf"))
+    for a in alphas:
+        s = (init * a).clamp(min=EPS_PC)
+        # broadcast (n_channels,) over the flattened axis
+        s_b = s.unsqueeze(-1)
+        x_q = torch.round(x_perm / s_b).clamp(qmin, qmax) * s_b
+        err = (x_perm - x_q).pow(2).mean(dim=1)
+        better = err < best_err
+        best_scale = torch.where(better, s, best_scale)
+        best_err = torch.where(better, err, best_err)
+    return best_scale
+
+
+# tiny epsilon for per-channel division (matches fake_quant.EPS)
+EPS_PC = 1e-8
+
+
+@register_observer("mse")
+class MSEObserver(BaseObserver):
+    """Per-tensor MSE-optimal scale (symmetric only).
+
+    Suitable for WEIGHTS. observe() performs the brute-force search and stores
+    the best scale directly. freeze() then just flips the mode flag.
+
+    Refuses asymmetric scheme — Phase 6 only ships the symmetric weight variant.
+    Activation MSE would need a different design (no outer freeze hook).
+    """
+
+    def __init__(
+        self,
+        bits: int,
+        scheme: str,
+        n_steps: int = 80,
+        p_min: float = 0.5,
+        p_max: float = 1.2,
+    ):
+        super().__init__(bits=bits, scheme=scheme)
+        if scheme != SYMMETRIC:
+            raise ValueError("MSEObserver only supports symmetric scheme (weights).")
+        self.n_steps = n_steps
+        self.p_min = p_min
+        self.p_max = p_max
+        # Keep min_val/max_val for diagnostic dump (main_quant.py reads these).
+        self.register_buffer("min_val", torch.tensor(0.0))
+        self.register_buffer("max_val", torch.tensor(0.0))
+        self._observed = False
+
+    def reset(self) -> None:
+        self._observed = False
+        self.min_val.fill_(0.0)
+        self.max_val.fill_(0.0)
+
+    def observe(self, x: Tensor) -> None:
+        x = x.detach()
+        self.min_val.copy_(x.min())
+        self.max_val.copy_(x.max())
+        s = _search_mse_scale_symmetric(
+            x, self.qmin, self.qmax, self.n_steps, self.p_min, self.p_max
+        )
+        self.scale.copy_(s)
+        self.zero_point.zero_()
+        self._observed = True
+
+    def freeze(self) -> None:
+        if not self._observed:
+            raise RuntimeError("Cannot freeze MSEObserver: no data observed.")
+        self.mode.fill_(FROZEN)
+
+
+@register_observer("per_channel_mse")
+class PerChannelMSEObserver(BaseObserver):
+    """Per-output-channel MSE-optimal scale (symmetric only).
+
+    Combines the per-channel granularity of PerChannelMinMaxObserver with
+    MSE-optimal scale selection. Targets the depthwise-conv 4-bit cliff:
+    per-channel min/max gives each channel its own scale but still uses the
+    most extreme value; MSE picks the scale that minimizes the per-channel
+    quantization error, which is typically slightly smaller than max(|W|)/qmax
+    for channels with heavy weight tails.
+    """
+
+    def __init__(
+        self,
+        bits: int,
+        scheme: str,
+        axis: int = 0,
+        n_steps: int = 80,
+        p_min: float = 0.5,
+        p_max: float = 1.2,
+    ):
+        super().__init__(bits=bits, scheme=scheme)
+        if scheme != SYMMETRIC:
+            raise ValueError("PerChannelMSEObserver only supports symmetric scheme.")
+        self.axis = axis
+        self.n_steps = n_steps
+        self.p_min = p_min
+        self.p_max = p_max
+        self.register_buffer("min_val", torch.tensor(0.0))
+        self.register_buffer("max_val", torch.tensor(0.0))
+        self._observed = False
+
+    def _reshape_for_broadcast(self, per_channel: Tensor, ref: Tensor) -> Tensor:
+        shape = [1] * ref.dim()
+        shape[self.axis] = -1
+        return per_channel.view(shape)
+
+    def reset(self) -> None:
+        self._observed = False
+        self.min_val = torch.tensor(0.0, device=self.min_val.device)
+        self.max_val = torch.tensor(0.0, device=self.max_val.device)
+
+    def observe(self, x: Tensor) -> None:
+        x = x.detach()
+        n_channels = x.shape[self.axis]
+        # Diagnostic: per-channel min/max for the dump.
+        dims = [d for d in range(x.dim()) if d != self.axis]
+        self.min_val = x.amin(dim=dims) if dims else x.clone()
+        self.max_val = x.amax(dim=dims) if dims else x.clone()
+        s = _search_mse_scale_per_channel_symmetric(
+            x, self.qmin, self.qmax, self.axis, self.n_steps, self.p_min, self.p_max
+        )
+        self.scale = s
+        self.zero_point = torch.zeros(n_channels, dtype=torch.int64, device=x.device)
+        self._observed = True
+
+    def freeze(self) -> None:
+        if not self._observed:
+            raise RuntimeError("Cannot freeze PerChannelMSEObserver: no data observed.")
+        self.mode.fill_(FROZEN)
+
+    def fake_quantize(self, x: Tensor) -> Tensor:
+        scale_b = self._reshape_for_broadcast(self.scale, x)
+        return fake_quantize_symmetric(x, scale_b, self.qmin, self.qmax)
+
+
+# ----------------------------------------------------------------------------
+# Phase 6b: Histogram + KL-divergence observer (TensorRT-style)
+# ----------------------------------------------------------------------------
+
+
+@register_observer("histogram")
+class HistogramObserver(BaseObserver):
+    """KL-divergence calibration for activations.
+
+    Streaming histogram over calibration batches; at freeze, search over candidate
+    truncation thresholds. The threshold minimizing KL(reference || candidate)
+    determines the clip range; scale follows.
+
+    Activation-only (asymmetric scheme by default; symmetric also supported by using
+    histogram of |x|). Works alongside other PTQ tools — drop-in replacement for
+    `min_max` or `percentile` via `--quant.act-observer histogram`.
+
+    Memory: O(n_bins) per observer (~16KB at default 2048 bins).
+    """
+
+    def __init__(
+        self,
+        bits: int,
+        scheme: str,
+        n_bins: int = 2048,
+        symmetric_uses_abs: bool = True,
+    ):
+        super().__init__(bits=bits, scheme=scheme)
+        self.n_bins = n_bins
+        self.symmetric_uses_abs = symmetric_uses_abs and (scheme == SYMMETRIC)
+        self.register_buffer("hist", torch.zeros(n_bins, dtype=torch.float64))
+        self.register_buffer("hist_min", torch.tensor(0.0, dtype=torch.float64))
+        self.register_buffer("hist_max", torch.tensor(0.0, dtype=torch.float64))
+        self.register_buffer("min_val", torch.tensor(0.0))  # diagnostic-only
+        self.register_buffer("max_val", torch.tensor(0.0))
+        self.register_buffer("initialized", torch.tensor(0, dtype=torch.int64))
+
+    def reset(self) -> None:
+        self.hist.zero_()
+        self.hist_min.zero_()
+        self.hist_max.zero_()
+        self.min_val.zero_()
+        self.max_val.zero_()
+        self.initialized.zero_()
+
+    def observe(self, x: Tensor) -> None:
+        x = x.detach().flatten()
+        if self.symmetric_uses_abs:
+            x = x.abs()
+
+        # Lazy device migration: histogram lives wherever the input lives.
+        if self.hist.device != x.device:
+            self.hist = self.hist.to(x.device)
+            self.hist_min = self.hist_min.to(x.device)
+            self.hist_max = self.hist_max.to(x.device)
+
+        # Update diagnostic min/max
+        cur_min = x.min().to(torch.float64)
+        cur_max = x.max().to(torch.float64)
+        self.min_val.copy_(cur_min.float())
+        self.max_val.copy_(cur_max.float())
+
+        if self.initialized.item() == 0:
+            # First batch: set range from this batch (with small padding)
+            lo = cur_min if not self.symmetric_uses_abs else torch.zeros_like(cur_min)
+            hi = cur_max
+            if hi == lo:
+                hi = lo + 1.0  # avoid zero-width
+            self.hist_min.copy_(lo)
+            self.hist_max.copy_(hi)
+            self.initialized.fill_(1)
+            h = torch.histc(
+                x.to(torch.float64), bins=self.n_bins,
+                min=self.hist_min.item(), max=self.hist_max.item(),
+            )
+            self.hist.copy_(h)
+            return
+
+        # Subsequent batches: if range expanded, redistribute existing histogram
+        if cur_max > self.hist_max:
+            self._expand_range(new_max=cur_max.item(),
+                               new_min=self.hist_min.item())
+        if not self.symmetric_uses_abs and cur_min < self.hist_min:
+            self._expand_range(new_max=self.hist_max.item(),
+                               new_min=cur_min.item())
+
+        h = torch.histc(
+            x.to(torch.float64), bins=self.n_bins,
+            min=self.hist_min.item(), max=self.hist_max.item(),
+        )
+        self.hist.add_(h)
+
+    def _expand_range(self, new_max: float, new_min: float) -> None:
+        """Rebin existing histogram into a wider range. Conservative: every old bin maps
+        to the nearest new bin via linear interpolation of bin centers."""
+        old_min = self.hist_min.item()
+        old_max = self.hist_max.item()
+        if new_min >= old_min and new_max <= old_max:
+            return
+        new_hist = torch.zeros(self.n_bins, dtype=torch.float64, device=self.hist.device)
+        old_centers = old_min + (torch.arange(self.n_bins, dtype=torch.float64,
+                                              device=self.hist.device) + 0.5) * (old_max - old_min) / self.n_bins
+        # Map each old center to its new bin
+        new_idx = ((old_centers - new_min) / (new_max - new_min) * self.n_bins).long().clamp(0, self.n_bins - 1)
+        new_hist.scatter_add_(0, new_idx, self.hist)
+        self.hist.copy_(new_hist)
+        self.hist_min.fill_(new_min)
+        self.hist_max.fill_(new_max)
+
+    def freeze(self) -> None:
+        if self.initialized.item() == 0:
+            raise RuntimeError("Cannot freeze HistogramObserver: no data observed.")
+        # Run KL search on the accumulated histogram.
+        target_levels = self.qmax - self.qmin + 1   # number of representable levels
+        threshold_value = _kl_threshold_search(
+            self.hist, self.hist_min.item(), self.hist_max.item(),
+            target_levels=target_levels,
+        )
+        if self.scheme == SYMMETRIC:
+            # threshold_value is the |x| clip range
+            max_abs = torch.tensor(threshold_value, dtype=torch.float32, device=self.scale.device)
+            self.scale.copy_(compute_scale_symmetric(max_abs, self.qmax))
+            self.zero_point.zero_()
+        else:
+            # asymmetric: KL search returns the upper clip; lower clip is hist_min.
+            # For activations like ReLU outputs, hist_min ~ 0; for general signed activations
+            # we'd want a 2-sided KL search. For Phase 6b we ship the simple one-sided path.
+            min_val = torch.tensor(float(self.hist_min.item()), dtype=torch.float32,
+                                   device=self.scale.device)
+            max_val = torch.tensor(float(threshold_value), dtype=torch.float32,
+                                   device=self.scale.device)
+            scale, zp = compute_scale_zp_asymmetric(min_val, max_val, self.qmin, self.qmax)
+            self.scale.copy_(scale)
+            self.zero_point.copy_(zp)
+        self.mode.fill_(FROZEN)
+
+
+# ----------------------------------------------------------------------------
+# Phase 7: Per-channel variants of percentile + histogram observers
+# ----------------------------------------------------------------------------
+
+
+@register_observer("per_channel_percentile")
+class PerChannelPercentileObserver(BaseObserver):
+    """Per-channel quantile-based observer (mirror of PercentileObserver).
+
+    For each channel along ``axis``, computes (low, high) quantiles over all other
+    dims; running mean across batches. Reduces the per-channel grid waste caused by
+    per-channel outliers — the main motivation for trying this on 4-bit weights, where
+    per_channel_min_max stretches 15 levels across the full max range.
+
+    Supports both symmetric and asymmetric schemes. Designed for weights (axis=0); the
+    per-channel granularity composes cleanly with int conv on the output dim.
+    """
+
+    def __init__(
+        self,
+        bits: int,
+        scheme: str,
+        axis: int = 0,
+        low_percentile: float = 0.001,
+        high_percentile: float = 0.999,
+    ):
+        super().__init__(bits=bits, scheme=scheme)
+        if not (0.0 <= low_percentile < high_percentile <= 1.0):
+            raise ValueError(
+                f"Require 0 <= low < high <= 1, got ({low_percentile}, {high_percentile})"
+            )
+        self.axis = axis
+        self.low_p = low_percentile
+        self.high_p = high_percentile
+        # Lazy (re)shape on first observe, like PerChannelMinMaxObserver.
+        self.register_buffer("min_val", torch.tensor(0.0))
+        self.register_buffer("max_val", torch.tensor(0.0))
+        self.register_buffer("n_batches", torch.tensor(0, dtype=torch.int64))
+
+    def _reshape_for_broadcast(self, per_channel: Tensor, ref: Tensor) -> Tensor:
+        shape = [1] * ref.dim()
+        shape[self.axis] = -1
+        return per_channel.view(shape)
+
+    def reset(self) -> None:
+        self.min_val = torch.tensor(0.0, device=self.min_val.device)
+        self.max_val = torch.tensor(0.0, device=self.max_val.device)
+        self.n_batches.zero_()
+
+    def observe(self, x: Tensor) -> None:
+        x = x.detach()
+        n_channels = x.shape[self.axis]
+        if self.min_val.numel() != n_channels:
+            self.min_val = torch.zeros(n_channels, device=x.device, dtype=x.dtype)
+            self.max_val = torch.zeros(n_channels, device=x.device, dtype=x.dtype)
+
+        perm = [self.axis] + [d for d in range(x.dim()) if d != self.axis]
+        x_perm = x.permute(perm).contiguous().view(n_channels, -1)
+        # subsample very large per-channel tensors (rare for weights)
+        if x_perm.shape[1] > 1_000_000:
+            idx = torch.randint(0, x_perm.shape[1], (1_000_000,), device=x.device)
+            x_perm = x_perm[:, idx]
+
+        low = torch.quantile(x_perm, self.low_p, dim=1)
+        high = torch.quantile(x_perm, self.high_p, dim=1)
+        n = self.n_batches.item()
+        self.min_val.copy_((self.min_val * n + low) / (n + 1))
+        self.max_val.copy_((self.max_val * n + high) / (n + 1))
+        self.n_batches.add_(1)
+
+    def freeze(self) -> None:
+        if self.n_batches.item() == 0:
+            raise RuntimeError(
+                "Cannot freeze PerChannelPercentileObserver: no data observed."
+            )
+        n = self.min_val.numel()
+        if self.scheme == SYMMETRIC:
+            max_abs = torch.maximum(self.min_val.abs(), self.max_val.abs())
+            self.scale = compute_scale_symmetric(max_abs, self.qmax)
+            self.zero_point = torch.zeros(n, dtype=torch.int64, device=self.min_val.device)
+        else:
+            scale, zp = compute_scale_zp_asymmetric(
+                self.min_val, self.max_val, self.qmin, self.qmax
+            )
+            self.scale = scale
+            self.zero_point = zp
+        self.mode.fill_(FROZEN)
+
+    def fake_quantize(self, x: Tensor) -> Tensor:
+        scale_b = self._reshape_for_broadcast(self.scale, x)
+        if self.scheme == SYMMETRIC:
+            return fake_quantize_symmetric(x, scale_b, self.qmin, self.qmax)
+        zp_b = self._reshape_for_broadcast(self.zero_point, x)
+        return fake_quantize_asymmetric(x, scale_b, zp_b, self.qmin, self.qmax)
+
+
+@register_observer("per_channel_histogram")
+class PerChannelHistogramObserver(BaseObserver):
+    """Per-channel histogram + KL-divergence calibration (mirror of HistogramObserver).
+
+    Each channel along ``axis`` gets its own (n_bins,) streaming histogram and its own
+    KL-optimal threshold. The per-j outer loop is shared across channels (vectorized
+    via batched scatter_add), so freeze cost stays in seconds even with 1024 channels.
+
+    Memory: O(n_channels * n_bins). For 1024 channels x 2048 bins x 8 bytes ~ 16 MB
+    per observer. Designed for weights (axis=0); activation use is possible but has
+    the usual per-channel composition issue.
+    """
+
+    def __init__(
+        self,
+        bits: int,
+        scheme: str,
+        axis: int = 0,
+        n_bins: int = 2048,
+        symmetric_uses_abs: bool = True,
+    ):
+        super().__init__(bits=bits, scheme=scheme)
+        self.axis = axis
+        self.n_bins = n_bins
+        self.symmetric_uses_abs = symmetric_uses_abs and (scheme == SYMMETRIC)
+        # Lazy 2D allocation on first observe — start as scalar/1D placeholders.
+        self.register_buffer("hist", torch.zeros(n_bins, dtype=torch.float64))
+        self.register_buffer("hist_min", torch.tensor(0.0, dtype=torch.float64))
+        self.register_buffer("hist_max", torch.tensor(0.0, dtype=torch.float64))
+        self.register_buffer("min_val", torch.tensor(0.0))   # diagnostic-only
+        self.register_buffer("max_val", torch.tensor(0.0))
+        self.register_buffer("initialized", torch.tensor(0, dtype=torch.int64))
+
+    def _reshape_for_broadcast(self, per_channel: Tensor, ref: Tensor) -> Tensor:
+        shape = [1] * ref.dim()
+        shape[self.axis] = -1
+        return per_channel.view(shape)
+
+    def reset(self) -> None:
+        self.initialized.zero_()
+        self.hist = torch.zeros(self.n_bins, dtype=torch.float64, device=self.hist.device)
+        self.hist_min = torch.tensor(0.0, dtype=torch.float64, device=self.hist.device)
+        self.hist_max = torch.tensor(0.0, dtype=torch.float64, device=self.hist.device)
+
+    def observe(self, x: Tensor) -> None:
+        x = x.detach()
+        n_channels = x.shape[self.axis]
+        perm = [self.axis] + [d for d in range(x.dim()) if d != self.axis]
+        x_perm = x.permute(perm).contiguous().view(n_channels, -1)
+        x_for_hist = x_perm.abs() if self.symmetric_uses_abs else x_perm
+
+        cur_min = x_for_hist.amin(dim=1).to(torch.float64)
+        cur_max = x_for_hist.amax(dim=1).to(torch.float64)
+
+        # Diagnostic min/max (signed)
+        self.min_val = x_perm.amin(dim=1).to(torch.float32)
+        self.max_val = x_perm.amax(dim=1).to(torch.float32)
+
+        if self.initialized.item() == 0:
+            self.hist = torch.zeros(
+                (n_channels, self.n_bins), dtype=torch.float64, device=x.device
+            )
+            self.hist_min = (
+                torch.zeros_like(cur_min) if self.symmetric_uses_abs else cur_min.clone()
+            )
+            self.hist_max = cur_max.clone()
+            zero_width = self.hist_max == self.hist_min
+            self.hist_max = torch.where(zero_width, self.hist_min + 1.0, self.hist_max)
+            self.initialized.fill_(1)
+        else:
+            if self.hist.device != x.device:
+                self.hist = self.hist.to(x.device)
+                self.hist_min = self.hist_min.to(x.device)
+                self.hist_max = self.hist_max.to(x.device)
+            need_max = cur_max > self.hist_max
+            need_min = (
+                (cur_min < self.hist_min)
+                if not self.symmetric_uses_abs
+                else torch.zeros_like(need_max)
+            )
+            if need_max.any() or need_min.any():
+                new_max = torch.maximum(self.hist_max, cur_max)
+                new_min = (
+                    torch.minimum(self.hist_min, cur_min)
+                    if not self.symmetric_uses_abs
+                    else self.hist_min
+                )
+                self._expand_range_per_channel(new_min, new_max)
+
+        # torch.histc has no batched form — loop. Cheap relative to KL search.
+        for c in range(n_channels):
+            h = torch.histc(
+                x_for_hist[c].to(torch.float64),
+                bins=self.n_bins,
+                min=self.hist_min[c].item(),
+                max=self.hist_max[c].item(),
+            )
+            self.hist[c].add_(h)
+
+    def _expand_range_per_channel(self, new_min: Tensor, new_max: Tensor) -> None:
+        n_channels = self.hist.shape[0]
+        new_hist = torch.zeros_like(self.hist)
+        n_bins_t = torch.arange(self.n_bins, dtype=torch.float64, device=self.hist.device)
+        for c in range(n_channels):
+            old_lo = self.hist_min[c].item()
+            old_hi = self.hist_max[c].item()
+            nlo = new_min[c].item()
+            nhi = new_max[c].item()
+            if nlo >= old_lo and nhi <= old_hi:
+                new_hist[c] = self.hist[c]
+                continue
+            old_centers = old_lo + (n_bins_t + 0.5) * (old_hi - old_lo) / self.n_bins
+            denom = max(nhi - nlo, 1e-12)
+            new_idx = (((old_centers - nlo) / denom) * self.n_bins).long().clamp(0, self.n_bins - 1)
+            new_hist[c].scatter_add_(0, new_idx, self.hist[c])
+        self.hist = new_hist
+        self.hist_min = new_min
+        self.hist_max = new_max
+
+    def freeze(self) -> None:
+        if self.initialized.item() == 0:
+            raise RuntimeError(
+                "Cannot freeze PerChannelHistogramObserver: no data observed."
+            )
+        n_channels = self.hist.shape[0]
+        target_levels = self.qmax - self.qmin + 1
+        thresholds = _kl_threshold_search_per_channel(
+            self.hist, self.hist_min, self.hist_max, target_levels
+        ).to(torch.float32)
+
+        if self.scheme == SYMMETRIC:
+            self.scale = compute_scale_symmetric(thresholds, self.qmax)
+            self.zero_point = torch.zeros(
+                n_channels, dtype=torch.int64, device=self.hist.device
+            )
+        else:
+            min_val = self.hist_min.to(torch.float32)
+            max_val = thresholds
+            scale, zp = compute_scale_zp_asymmetric(min_val, max_val, self.qmin, self.qmax)
+            self.scale = scale
+            self.zero_point = zp
+        self.mode.fill_(FROZEN)
+
+    def fake_quantize(self, x: Tensor) -> Tensor:
+        scale_b = self._reshape_for_broadcast(self.scale, x)
+        if self.scheme == SYMMETRIC:
+            return fake_quantize_symmetric(x, scale_b, self.qmin, self.qmax)
+        zp_b = self._reshape_for_broadcast(self.zero_point, x)
+        return fake_quantize_asymmetric(x, scale_b, zp_b, self.qmin, self.qmax)
+
+
+def _kl_threshold_search_per_channel(
+    hist: Tensor,        # (C, n_bins)
+    hist_min: Tensor,    # (C,)
+    hist_max: Tensor,    # (C,)
+    target_levels: int,
+) -> Tensor:
+    """Vectorized per-channel KL search. Loops over j only; channel dim is batched.
+
+    For each channel, finds j in [target_levels, n_bins] minimizing KL(P || Q) using
+    the same TRT-style fold-in convention as ``_kl_threshold_search``. Returns the
+    per-channel upper-edge threshold of shape (C,).
+    """
+    n_channels, n_bins = hist.shape
+    if target_levels >= n_bins:
+        return hist_max.clone()
+    bin_widths = (hist_max - hist_min) / n_bins                # (C,)
+    h = hist.to(torch.float64)
+    eps = 1e-12
+
+    tail_sum = h.flip(1).cumsum(1).flip(1)                     # (C, n_bins)
+
+    best_kl = torch.full(
+        (n_channels,), float("inf"), dtype=torch.float64, device=h.device
+    )
+    best_j = torch.full(
+        (n_channels,), target_levels, dtype=torch.long, device=h.device
+    )
+
+    for j in range(target_levels, n_bins + 1):
+        sliced = h[:, :j]                                      # (C, j)
+        P = sliced.clone()
+        if j < n_bins:
+            P[:, -1] = P[:, -1] + tail_sum[:, j]
+        P_sum = P.sum(dim=1)                                   # (C,)
+
+        idx = (torch.arange(j, device=h.device, dtype=torch.long) * target_levels) // j
+        idx_b = idx.unsqueeze(0).expand(n_channels, j)         # (C, j)
+        mask = (sliced > 0).to(torch.float64)
+        group_sum = torch.zeros(
+            (n_channels, target_levels), dtype=torch.float64, device=h.device
+        )
+        group_count = torch.zeros_like(group_sum)
+        group_sum.scatter_add_(1, idx_b, sliced)
+        group_count.scatter_add_(1, idx_b, mask)
+        per_group_avg = group_sum / group_count.clamp(min=1.0)
+        Q = mask * per_group_avg.gather(1, idx_b)
+        Q_sum = Q.sum(dim=1)                                   # (C,)
+
+        valid = (P_sum > 0) & (Q_sum > 0)
+        P_norm = P / P_sum.clamp(min=eps).unsqueeze(1)
+        Q_norm = Q / Q_sum.clamp(min=eps).unsqueeze(1)
+        mask_P = (P > 0).to(torch.float64)
+        log_ratio = torch.log((P_norm + eps) / (Q_norm + eps))
+        kl = (P_norm * log_ratio * mask_P).sum(dim=1)          # (C,)
+
+        better = valid & (kl < best_kl)
+        best_kl = torch.where(better, kl, best_kl)
+        j_t = torch.tensor(j, device=h.device, dtype=torch.long)
+        best_j = torch.where(better, j_t, best_j)
+
+    thresholds = hist_min + best_j.to(hist_min.dtype) * bin_widths
+    return thresholds
+
+
+def _kl_threshold_search(
+    hist: Tensor,
+    hist_min: float,
+    hist_max: float,
+    target_levels: int,
+) -> float:
+    """TensorRT-style KL-divergence search (vectorized inner Q construction).
+
+    Outer loop: candidate truncation index j in [target_levels, n_bins].
+    Inner Q construction is done with scatter_add, eliminating Python iteration over
+    target_levels. With 2048 bins x 256 target_levels, the freeze cost drops from
+    ~200s to a few seconds on GPU.
+
+    For each j:
+      P = hist[:j] with the tail [j:] folded into bin j-1.
+      Group bins in [0, j) into target_levels groups by `group_idx = i * target_levels // j`.
+      Q[i] = (P>0)*(group_sum / group_active_count)[group_idx[i]].
+      KL(P || Q) over P>0 mass.
+    Pick the j minimizing KL; return the corresponding upper edge value.
+    """
+    n_bins = hist.numel()
+    if target_levels >= n_bins:
+        return hist_max
+    bin_width = (hist_max - hist_min) / n_bins
+    h = hist.to(torch.float64)
+    eps = 1e-12
+
+    # Reverse cumsum: tail_sum[j] = sum(h[j:]). Used for the fold-in step.
+    tail_sum = h.flip(0).cumsum(0).flip(0)
+
+    best_kl = float("inf")
+    best_j = target_levels
+    for j in range(target_levels, n_bins + 1):
+        # SLICE = h[:j] (the un-folded histogram — used to build Q).
+        sliced = h[:j]
+        # P = SLICE with the right tail folded into bin j-1 (used as the reference).
+        P = sliced.clone()
+        if j < n_bins:
+            P[-1] = P[-1] + tail_sum[j]
+        P_sum = P.sum()
+        if P_sum.item() <= 0:
+            continue
+
+        # Q is built from SLICE (no fold-in). Group bins into target_levels bins,
+        # average within each group over bins where SLICE>0, expand back to length j.
+        # Critically: this means when SLICE has a thin tail and P has a fat fold-in
+        # spike, Q at index j-1 is small but P at index j-1 is large -> KL > 0.
+        idx = (torch.arange(j, device=h.device, dtype=torch.long) * target_levels) // j
+        mask = (sliced > 0).to(torch.float64)
+        group_sum = torch.zeros(target_levels, dtype=torch.float64, device=h.device)
+        group_count = torch.zeros(target_levels, dtype=torch.float64, device=h.device)
+        group_sum.scatter_add_(0, idx, sliced)
+        group_count.scatter_add_(0, idx, mask)
+        per_group_avg = group_sum / group_count.clamp(min=1.0)
+        Q = mask * per_group_avg[idx]
+        Q_sum = Q.sum()
+        if Q_sum.item() <= 0:
+            continue
+
+        P_norm = P / P_sum
+        Q_norm = Q / Q_sum
+        # KL(P || Q) — use a P>0 mask (fold-in spike makes P[-1] non-zero even if SLICE[-1]==0)
+        mask_P = (P > 0).to(torch.float64)
+        log_ratio = torch.log((P_norm + eps) / (Q_norm + eps))
+        kl = (P_norm * log_ratio * mask_P).sum().item()
+
+        if kl < best_kl:
+            best_kl = kl
+            best_j = j
+
+    return hist_min + best_j * bin_width

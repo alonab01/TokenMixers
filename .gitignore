@@ -158,3 +158,8 @@ Dataset_Root/
 *.bmp
 *.tiff
 *.webp
+
+# more things to ignore
+*/docs/
+*/.claude/
+*/results/

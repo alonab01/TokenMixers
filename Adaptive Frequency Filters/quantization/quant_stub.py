@@ -1,20 +1,32 @@
-"""QuantStub — insert re-quantization points at block boundaries.
+"""QuantStub — insert re-quantization points at chosen FP32 boundaries.
 
-Phase 3: simulate real hardware data flow. In deployed INT hardware, a tensor
-leaving one block stays on the quantization grid when entering the next block;
-it does not transiently live as unconstrained FP32. A QuantStub is placed at
-every such boundary to re-quantize the tensor after any FP32 operation
-(residual-add, activation, BN, AFNO2D output, GlobalPool, ...).
+A QuantStub re-quantizes a single tensor; its state machine is the usual
+DISABLED / CALIBRATING / FROZEN from BaseObserver. Stubs are a flexible tool
+for any FP32 boundary the user wants on the Q grid (LayerNorm input,
+BatchNorm input, activation function input, AFNO2D output, GlobalPool, ...).
+Conv/Linear inputs are NOT a stub job — those self-quantize via QuantConv2d /
+QuantLinear's own act_observer.
 
-The stub wraps a standard activation observer. Its state machine is the usual
-DISABLED / CALIBRATING / FROZEN from BaseObserver — no new math.
+The companion `StubConfig` dataclass is the per-type config consumed by
+convert.py::_insert_stubs to dispatch (bits, observer, scheme) per nn.Module
+type.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch.nn as nn
 from torch import Tensor
 
 from quantization.observer import BaseObserver, build_observer
+
+
+@dataclass(frozen=True)
+class StubConfig:
+    """Per-type stub configuration consumed by _insert_stubs."""
+    bits: int
+    observer: str = "percentile"
+    scheme: str = "asymmetric"
 
 
 class QuantStub(nn.Module):

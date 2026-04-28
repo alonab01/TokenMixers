@@ -1,31 +1,26 @@
 """Walk a model and install quantization modules.
 
 Design:
-  - QuantConv2d / QuantLinear: weight-only fake-quantization. No act_observer.
-  - PreStubbedModule: wraps a block and quantizes its INPUT before it runs.
-    This models the int8 memory read at the start of each hardware fused kernel.
-    Activation quantization lives exclusively in these stubs.
+  - QuantConv2d / QuantLinear: own weight + activation observers. Each Conv/Linear
+    quantizes its own input — that is the dominant activation-Q path.
+  - QuantStub (via PreStubbedModule): a flexible tool for additional FP32
+    boundaries the user wants on the Q grid (LayerNorm, BatchNorm, activation
+    fns, AFNO2D output, GlobalPool, ...). Per-type config via StubConfig.
 
-Phase 1/2: nn.Conv2d -> QuantConv2d (weight-only, respects skip-list).
-Phase 3 additions (opt-in):
-  (a) Linear -> QuantLinear (weight-only).
-  (b) Block-level pre-stubs via PreStubbedModule: one stub per hardware boundary.
-      Default targets: InvertedResidual, Block, GlobalPool.
-      AFFBlock is excluded — its forward passes directly to Block[0] with no
-      intervening transform, so wrapping both would double-quant the same tensor.
-  (c) Standalone ConvLayer pre-stubs (Phase 2 of _insert_stubs): wraps every
-      ConvLayer that is NOT already inside a wrapped block. Catches conv_1x1_exp
-      and each AFFBlock.conv_proj, giving a complete set of hardware boundaries.
+`insert_stubs=True` with no targets is a no-op (warning). Default empty:
+stubs are explicitly opt-in — Conv/Linear self-quantization is the default
+activation-Q surface.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Type
+from typing import Dict, List, Optional, Sequence, Tuple, Type
 
 from torch import nn
 
 from quantization.quant_conv import QuantConv2d
 from quantization.quant_linear import QuantLinear
-from quantization.quant_stub import QuantStub, PreStubbedModule
+from quantization.quant_stub import PreStubbedModule, QuantStub, StubConfig
+from utils import logger
 
 
 def _is_skipped(path: str, skip_list: Sequence[str]) -> bool:
@@ -52,7 +47,7 @@ def _set_submodule(parent: nn.Module, attr: str, new: nn.Module) -> None:
         setattr(parent, attr, new)
 
 
-# ---------- Conv2d swap (Phase 1/2) ---------- #
+# ---------- Conv2d / Linear swap ---------- #
 
 
 def convert_model(
@@ -64,44 +59,54 @@ def convert_model(
     weight_scheme: str = "symmetric",
     act_scheme: str = "asymmetric",
     skip_modules: Sequence[str] = (),
-    # Phase 3 additions (all opt-in) #
     quantize_linear: bool = False,
     skip_linears: Sequence[str] = (),
     insert_stubs: bool = False,
     skip_stubs: Sequence[str] = (),
+    stub_target_configs: Optional[Dict[Type[nn.Module], StubConfig]] = None,
+    # Back-compat scalar fallbacks: only consulted when stub_target_configs is None
+    # and stub_targets is provided. They build a uniform-config dict.
     stub_bits: Optional[int] = None,
     stub_observer: str = "percentile",
     stub_scheme: str = "asymmetric",
     stub_targets: Optional[Sequence[Type[nn.Module]]] = None,
 ) -> Tuple[nn.Module, List[str]]:
-    """In-place swap of nn.Conv2d -> QuantConv2d (weight-only) and optionally
-    Linear -> QuantLinear (weight-only) and PreStubbedModule wrapping at block
-    boundaries for hardware-faithful activation quantization.
-
-    act_bits / act_observer / act_scheme are passed to stubs (not to Conv/Linear).
+    """In-place swap of nn.Conv2d -> QuantConv2d (weight + input act) and optionally
+    nn.Linear / LinearLayer -> QuantLinear (weight + input act). Optional per-type
+    PreStubbedModule wrapping for non-Conv/Linear FP32 boundaries.
 
     Returns (model, list_of_swapped_conv_paths).
     """
-    conv_cfg = dict(
+    quant_cfg = dict(
         weight_bits=weight_bits,
         weight_observer=weight_observer,
         weight_scheme=weight_scheme,
+        act_bits=act_bits,
+        act_observer=act_observer,
+        act_scheme=act_scheme,
     )
 
-    swapped_convs = _swap_conv2d(model, conv_cfg, skip_modules)
+    swapped_convs = _swap_conv2d(model, quant_cfg, skip_modules)
 
     if quantize_linear:
-        _swap_linears(model, conv_cfg, skip_linears)
+        _swap_linears(model, quant_cfg, skip_linears)
 
     if insert_stubs:
-        _insert_stubs(
-            model,
-            stub_bits=stub_bits if stub_bits is not None else act_bits,
-            stub_observer=stub_observer,
-            stub_scheme=stub_scheme,
-            skip_stubs=skip_stubs,
-            targets=stub_targets,
-        )
+        cfgs = stub_target_configs
+        if cfgs is None and stub_targets is not None:
+            fallback = StubConfig(
+                bits=stub_bits if stub_bits is not None else act_bits,
+                observer=stub_observer,
+                scheme=stub_scheme,
+            )
+            cfgs = {t: fallback for t in stub_targets}
+        if cfgs:
+            _insert_stubs(model, target_configs=cfgs, skip_stubs=skip_stubs)
+        else:
+            logger.warning(
+                "[quant] insert_stubs=True but no stub_target_configs / stub_targets "
+                "provided — no stubs inserted."
+            )
 
     return model, swapped_convs
 
@@ -130,15 +135,12 @@ def _swap_conv2d(
     return swapped
 
 
-# ---------- Linear swap (Phase 3) ---------- #
-
-
 def _swap_linears(
     model: nn.Module,
     cfg: dict,
     skip_linears: Sequence[str],
 ) -> List[str]:
-    """Swap nn.Linear and AFFNet LinearLayer -> QuantLinear (weight-only).
+    """Swap nn.Linear and AFFNet LinearLayer -> QuantLinear (weight + input act).
     Skips channel_first LinearLayers (those route through F.conv2d)."""
     from affnet.layers.linear_layer import GroupLinear, LinearLayer
 
@@ -166,105 +168,60 @@ def _swap_linears(
     return swapped
 
 
-# ---------- Stub insertion (Phase 3) ---------- #
+# ---------- Stub insertion (per-type) ---------- #
 
 
-def _default_stub_targets() -> Tuple[Type[nn.Module], ...]:
-    """Module types whose INPUTS are pre-quantized (hardware INT8 memory read).
+def _match_target(module: nn.Module, target_configs: Dict[Type[nn.Module], StubConfig]) -> Optional[Type[nn.Module]]:
+    """Find the first key in target_configs that `module` is an instance of.
 
-    InvertedResidual (MBConv): one fused kernel — expand + DW + project.
-    Block: the post-AFNO2D residual boundary. LayerNorm runs before Block.mlp,
-           so Block + IR stubs quantize two DIFFERENT tensors (no double-quant).
-    GlobalPool: the final spatial reduction before the classifier head.
-
-    AFFBlock is intentionally excluded: its forward passes the input directly to
-    Block[0] without any transform, so wrapping both AFFBlock and Block would
-    double-quant the same tensor.
-
-    Standalone ConvLayers not inside these targets (e.g., conv_1x1_exp,
-    AFFBlock.conv_proj) are handled by the Phase 2 ConvLayer pass in _insert_stubs.
+    Insertion order of the dict determines priority when a module would match
+    multiple keys (e.g. a class and one of its bases).
     """
-    from affnet.layers.global_pool import GlobalPool
-    from affnet.modules.aff_block import Block
-    from affnet.modules.mobilenetv2 import InvertedResidual, InvertedResidualSE
-
-    return (InvertedResidual, InvertedResidualSE, Block, GlobalPool)
+    for cls in target_configs:
+        if isinstance(module, cls):
+            return cls
+    return None
 
 
 def _insert_stubs(
     model: nn.Module,
-    stub_bits: int,
-    stub_observer: str,
-    stub_scheme: str,
-    skip_stubs: Sequence[str],
-    targets: Optional[Sequence[Type[nn.Module]]] = None,
+    target_configs: Dict[Type[nn.Module], StubConfig],
+    skip_stubs: Sequence[str] = (),
 ) -> List[str]:
-    if targets is None:
-        targets = _default_stub_targets()
-    target_types = tuple(targets)
+    """Wrap every module matching a key in target_configs with PreStubbedModule.
 
-    # ---- Phase 1: wrap block-level targets (deepest path first) ----
-    # Collect first; mutating named_modules mid-iteration is unsafe.
-    hits: List[Tuple[str, nn.Module]] = []
+    Walk the model once; for each module find the first matching type in
+    target_configs (isinstance, so subclasses match), build a QuantStub from the
+    matched type's StubConfig, and replace the module with PreStubbedModule(inner=mod, stub=stub).
+
+    Skips any module already wrapped by a stub or that IS itself a quant module
+    (PreStubbedModule, QuantStub, QuantConv2d, QuantLinear) — those have their
+    own activation-Q story.
+    """
+    if not target_configs:
+        return []
+
+    hits: List[Tuple[str, nn.Module, Type[nn.Module]]] = []
     for path, module in model.named_modules():
         if path == "":
             continue
         if isinstance(module, (PreStubbedModule, QuantStub, QuantConv2d, QuantLinear)):
             continue
-        if not isinstance(module, target_types):
-            continue
         if _is_skipped(path, skip_stubs):
             continue
-        hits.append((path, module))
+        matched = _match_target(module, target_configs)
+        if matched is None:
+            continue
+        hits.append((path, module, matched))
 
-    # Deepest first: once a module is wrapped, StubbedModule doesn't proxy
+    # Deepest first: once a module is wrapped, PreStubbedModule doesn't proxy
     # arbitrary attributes, so ancestor paths become untraversable.
-    hits.sort(key=lambda pm: pm[0].count("."), reverse=True)
+    hits.sort(key=lambda pmt: pmt[0].count("."), reverse=True)
 
     wrapped: List[str] = []
-    for path, mod in hits:
-        stub = QuantStub(act_bits=stub_bits, act_observer=stub_observer, act_scheme=stub_scheme)
-        wrapper = PreStubbedModule(inner=mod, stub=stub)
-        parent, attr = _get_parent_and_attr(model, path)
-        _set_submodule(parent, attr, wrapper)
-        wrapped.append(path)
-
-    # ---- Phase 2: wrap standalone ConvLayers not inside wrapped blocks ----
-    # Catches conv_1x1_exp, AFFBlock.conv_proj, and any other top-level ConvLayer
-    # that is not already inside a PreStubbedModule's inner.
-    try:
-        from affnet.layers.conv_layer import ConvLayer
-    except ImportError:
-        return wrapped  # non-AFFNet model, skip Phase 2
-
-    # Build excluded prefixes: paths that are inside any already-wrapped module's .inner
-    excluded_prefixes = {
-        path + ".inner"
-        for path, module in model.named_modules()
-        if isinstance(module, PreStubbedModule)
-    }
-
-    def _is_inside_wrapped(p: str) -> bool:
-        return any(p == ep or p.startswith(ep + ".") for ep in excluded_prefixes)
-
-    conv_hits: List[Tuple[str, nn.Module]] = []
-    for path, module in model.named_modules():
-        if path == "":
-            continue
-        if isinstance(module, (PreStubbedModule, QuantStub)):
-            continue
-        if not isinstance(module, ConvLayer):
-            continue
-        if _is_skipped(path, skip_stubs):
-            continue
-        if _is_inside_wrapped(path):
-            continue
-        conv_hits.append((path, module))
-
-    conv_hits.sort(key=lambda pm: pm[0].count("."), reverse=True)
-
-    for path, mod in conv_hits:
-        stub = QuantStub(act_bits=stub_bits, act_observer=stub_observer, act_scheme=stub_scheme)
+    for path, mod, matched_type in hits:
+        cfg = target_configs[matched_type]
+        stub = QuantStub(act_bits=cfg.bits, act_observer=cfg.observer, act_scheme=cfg.scheme)
         wrapper = PreStubbedModule(inner=mod, stub=stub)
         parent, attr = _get_parent_and_attr(model, path)
         _set_submodule(parent, attr, wrapper)
@@ -283,8 +240,8 @@ def collect_quant_convs(model: nn.Module) -> List[QuantConv2d]:
 def collect_quant_modules(model: nn.Module) -> List[nn.Module]:
     """All modules whose activation observer participates in calibration.
 
-    With the current architecture — stubs own all activation Q — this returns
-    only QuantStub instances. Duck-typed on .act_observer for future extensibility.
+    Duck-typed on .act_observer: covers QuantConv2d, QuantLinear, QuantStub, and
+    any future module that wears a BaseObserver under that name.
     """
     from quantization.observer import BaseObserver
     return [

@@ -13,10 +13,10 @@ from quantization.convert import (
     collect_quant_stubs,
     convert_model,
 )
-from quantization.observer import FROZEN
+from quantization.observer import BaseObserver, FROZEN
 from quantization.quant_conv import QuantConv2d
 from quantization.quant_linear import QuantLinear
-from quantization.quant_stub import QuantStub, PreStubbedModule
+from quantization.quant_stub import PreStubbedModule, QuantStub, StubConfig
 
 
 # -------- skip-list matching -------- #
@@ -87,6 +87,13 @@ def test_convert_respects_skip_list():
     assert not isinstance(model.conv_1.conv, QuantConv2d)
 
 
+def test_convert_default_skip_list_is_empty():
+    """No conv is skipped by default; conv_1 is no longer special."""
+    model = ToyNet()
+    _, swapped = convert_model(model, weight_bits=8, act_bits=8)
+    assert "conv_1.conv" in swapped
+
+
 def test_convert_handles_sequential_numeric_indices():
     model = ToyNet()
     convert_model(model, weight_bits=8, act_bits=8)
@@ -100,21 +107,31 @@ def test_forward_still_works_after_convert():
     assert model(torch.randn(2, 3, 16, 16)).shape == (2, 10)
 
 
-def test_converted_convs_have_no_act_observer():
-    """QuantConv2d must NOT have act_observer — activation Q lives in stubs."""
+def test_converted_convs_have_act_observer():
+    """Every QuantConv2d carries its own act_observer (restored from Phase 1/2)."""
     model = ToyNet()
     convert_model(model, weight_bits=8, act_bits=8)
     for qc in collect_quant_convs(model):
-        assert not hasattr(qc, "act_observer")
+        assert isinstance(qc.act_observer, BaseObserver)
 
 
-# -------- calibrate — requires stubs -------- #
+# -------- calibrate — works without stubs (Conv act observers are enough) -------- #
 
 
-def test_calibrate_without_stubs_raises():
-    """Without stubs there are no act_observers, so calibrate must raise."""
+def test_calibrate_works_without_stubs():
+    """With per-Conv act observers, calibrate runs even without stubs."""
     model = ToyNet()
     convert_model(model, weight_bits=8, act_bits=8)
+    n = calibrate(model, [torch.randn(2, 3, 16, 16) for _ in range(2)], n_batches=2)
+    # 3 QuantConv2d → 3 act observers
+    assert n == 3
+    for qc in collect_quant_convs(model):
+        assert int(qc.act_observer.mode.item()) == FROZEN
+
+
+def test_calibrate_raises_when_no_quant_modules():
+    """Pre-convert calibrate should still raise — no observers to drive."""
+    model = ToyNet()
     with pytest.raises(RuntimeError, match="No quantized modules"):
         calibrate(model, iter([torch.randn(2, 3, 16, 16)]), n_batches=1)
 
@@ -123,12 +140,13 @@ def test_calibrate_without_stubs_raises():
 
 
 def test_weight_only_16bit_near_fp32_output():
-    """16-bit weight fake-quant (no stubs) should be near FP32 — no calibrate needed."""
+    """16-bit weight + DISABLED act_observers = near FP32, no calibrate needed."""
     torch.manual_seed(7)
     model = ToyNet().eval()
     x = torch.randn(2, 3, 16, 16)
     y_fp = model(x)
     convert_model(model, weight_bits=16, act_bits=16)
+    # act_observers are DISABLED until set_mode(CALIBRATING) is called -> passthrough
     y_q = model(x)
     assert (y_fp - y_q).abs().max().item() < 1e-2
 
@@ -159,17 +177,18 @@ def test_quantize_linear_respects_skip_list():
     assert isinstance(model.classifier, nn.Linear)
 
 
-def test_quantize_linear_has_no_act_observer():
+def test_quantize_linear_has_act_observer():
+    """QuantLinear also gets its own act_observer."""
     model = ToyNet()
     convert_model(model, weight_bits=8, act_bits=8, quantize_linear=True)
-    assert not hasattr(model.classifier, "act_observer")
+    assert isinstance(model.classifier.act_observer, BaseObserver)
 
 
-# -------- insert_stubs with real AFFNet module types -------- #
+# -------- insert_stubs: per-type config + empty default -------- #
 
 
 class ToyIRNet(nn.Module):
-    """Small net using AFFNet's InvertedResidual so the default stub walker finds targets."""
+    """Small net using AFFNet's InvertedResidual so the stub walker has interesting targets."""
 
     def __init__(self, opts):
         super().__init__()
@@ -204,17 +223,69 @@ def ir_opts():
     return ns
 
 
-def test_insert_stubs_wraps_inverted_residuals(ir_opts):
+def test_insert_stubs_default_is_no_op(ir_opts):
+    """`insert_stubs=True` without target configs/targets is a no-op (warning emitted)."""
     model = ToyIRNet(opts=ir_opts)
     convert_model(model, weight_bits=8, act_bits=8, insert_stubs=True)
+    assert not isinstance(model.ir1, PreStubbedModule)
+    assert not isinstance(model.ir2, PreStubbedModule)
+    assert len(collect_quant_stubs(model)) == 0
+
+
+def test_insert_stubs_target_configs_per_type(ir_opts):
+    """Different module types can carry different StubConfigs."""
+    from affnet.modules.mobilenetv2 import InvertedResidual
+    from affnet.layers.global_pool import GlobalPool
+
+    model = ToyIRNet(opts=ir_opts)
+    convert_model(
+        model, weight_bits=8, act_bits=8,
+        insert_stubs=True,
+        stub_target_configs={
+            InvertedResidual: StubConfig(bits=8, observer="percentile", scheme="asymmetric"),
+            GlobalPool: StubConfig(bits=4, observer="min_max", scheme="asymmetric"),
+        },
+    )
+    # ir1 + ir2 wrapped at 8 bits (no GlobalPool in this toy net)
     assert isinstance(model.ir1, PreStubbedModule)
     assert isinstance(model.ir2, PreStubbedModule)
-    assert len(collect_quant_stubs(model)) >= 2
+    stubs = collect_quant_stubs(model)
+    assert len(stubs) == 2
+    for s in stubs:
+        assert s.act_bits == 8
+
+
+def test_insert_stubs_per_type_picks_correct_bits(ir_opts):
+    """A target_configs dict with two types yields stubs with the correct per-type bits."""
+    from affnet.modules.mobilenetv2 import InvertedResidual
+
+    model = ToyIRNet(opts=ir_opts)
+    # Wrap nn.Linear at 4b and InvertedResidual at 8b
+    convert_model(
+        model, weight_bits=8, act_bits=8,
+        insert_stubs=True,
+        stub_target_configs={
+            InvertedResidual: StubConfig(bits=8, observer="min_max"),
+            nn.Linear: StubConfig(bits=4, observer="min_max"),
+        },
+    )
+    # head is a plain nn.Linear -> wrapped at 4b
+    assert isinstance(model.head, PreStubbedModule)
+    assert model.head.stub.act_bits == 4
+    # ir1/ir2 wrapped at 8b
+    assert isinstance(model.ir1, PreStubbedModule)
+    assert model.ir1.stub.act_bits == 8
 
 
 def test_insert_stubs_respects_skip_list(ir_opts):
+    from affnet.modules.mobilenetv2 import InvertedResidual
+
     model = ToyIRNet(opts=ir_opts)
-    convert_model(model, weight_bits=8, act_bits=8, insert_stubs=True, skip_stubs=["ir1"])
+    convert_model(
+        model, weight_bits=8, act_bits=8, insert_stubs=True,
+        stub_target_configs={InvertedResidual: StubConfig(bits=8)},
+        skip_stubs=["ir1"],
+    )
     assert not isinstance(model.ir1, PreStubbedModule)
     assert isinstance(model.ir2, PreStubbedModule)
 
@@ -227,35 +298,75 @@ def test_insert_stubs_off_by_default(ir_opts):
     assert len(collect_quant_stubs(model)) == 0
 
 
+def test_insert_stubs_fallback_via_stub_targets(ir_opts):
+    """Back-compat: stub_targets + scalar stub_bits/observer/scheme builds a uniform config."""
+    from affnet.modules.mobilenetv2 import InvertedResidual
+
+    model = ToyIRNet(opts=ir_opts)
+    convert_model(
+        model, weight_bits=8, act_bits=8, insert_stubs=True,
+        stub_targets=[InvertedResidual],
+        stub_bits=8, stub_observer="min_max", stub_scheme="asymmetric",
+    )
+    assert isinstance(model.ir1, PreStubbedModule)
+    assert isinstance(model.ir2, PreStubbedModule)
+    assert all(s.act_bits == 8 for s in collect_quant_stubs(model))
+
+
+def test_insert_stubs_skips_quant_modules(ir_opts):
+    """A QuantConv2d/QuantLinear must not be wrapped — they self-quantize."""
+    model = ToyIRNet(opts=ir_opts)
+    # Try to wrap nn.Linear (already QuantLinear after quantize_linear=True)
+    convert_model(
+        model, weight_bits=8, act_bits=8, quantize_linear=True,
+        insert_stubs=True,
+        stub_target_configs={nn.Linear: StubConfig(bits=8, observer="min_max")},
+    )
+    assert isinstance(model.head, QuantLinear)
+    assert not isinstance(model.head, PreStubbedModule)
+
+
 def test_forward_still_works_with_stubs(ir_opts):
+    from affnet.modules.mobilenetv2 import InvertedResidual
+
     torch.manual_seed(3)
     model = ToyIRNet(opts=ir_opts).eval()
-    convert_model(model, weight_bits=16, act_bits=16, quantize_linear=True, insert_stubs=True)
+    convert_model(
+        model, weight_bits=16, act_bits=16, quantize_linear=True, insert_stubs=True,
+        stub_target_configs={InvertedResidual: StubConfig(bits=16, observer="min_max")},
+    )
     assert model(torch.randn(2, 3, 16, 16)).shape == (2, 4)
 
 
-# -------- calibrate with stubs -------- #
+# -------- calibrate with stubs + per-Conv observers -------- #
 
 
-def test_calibrate_drives_stub_observers_to_frozen(ir_opts):
+def test_calibrate_drives_all_observers_to_frozen(ir_opts):
+    """calibrate freezes both per-Conv act_observers AND stubs."""
+    from affnet.modules.mobilenetv2 import InvertedResidual
+
     model = ToyIRNet(opts=ir_opts).eval()
-    convert_model(model, weight_bits=8, act_bits=8, insert_stubs=True)
-    stubs = collect_quant_stubs(model)
-    assert len(stubs) == 2
+    convert_model(
+        model, weight_bits=8, act_bits=8, insert_stubs=True,
+        stub_target_configs={InvertedResidual: StubConfig(bits=8, observer="min_max")},
+    )
+    n_convs = len(collect_quant_convs(model))
+    n_stubs = len(collect_quant_stubs(model))
+    assert n_stubs == 2
 
     qms = collect_quant_modules(model)
-    assert len(qms) == 2  # only the 2 stubs — no conv act_observers
+    assert len(qms) == n_convs + n_stubs
 
     batches = [torch.randn(2, 3, 16, 16) for _ in range(4)]
     n = calibrate(model, batches, n_batches=4)
-    assert n == 2
-    for s in stubs:
-        assert int(s.act_observer.mode.item()) == FROZEN
+    assert n == n_convs + n_stubs
+    for qm in qms:
+        assert int(qm.act_observer.mode.item()) == FROZEN
 
 
 def test_calibrate_respects_n_batches(ir_opts):
     model = ToyIRNet(opts=ir_opts).eval()
-    convert_model(model, weight_bits=8, act_bits=8, insert_stubs=True)
+    convert_model(model, weight_bits=8, act_bits=8)
     count = [0]
 
     def gen():
@@ -269,38 +380,46 @@ def test_calibrate_respects_n_batches(ir_opts):
 
 def test_calibrate_input_fn_extracts_from_dict(ir_opts):
     model = ToyIRNet(opts=ir_opts).eval()
-    convert_model(model, weight_bits=8, act_bits=8, insert_stubs=True)
+    convert_model(model, weight_bits=8, act_bits=8)
     batches = [{"samples": torch.randn(1, 3, 8, 8), "targets": torch.tensor([0])} for _ in range(3)]
     calibrate(model, batches, n_batches=3, input_fn=lambda b: b["samples"])
-    for s in collect_quant_stubs(model):
-        assert int(s.act_observer.mode.item()) == FROZEN
+    for qc in collect_quant_convs(model):
+        assert int(qc.act_observer.mode.item()) == FROZEN
 
 
 def test_calibrate_restores_training_mode(ir_opts):
     model = ToyIRNet(opts=ir_opts)
     model.train()
-    convert_model(model, weight_bits=8, act_bits=8, insert_stubs=True)
+    convert_model(model, weight_bits=8, act_bits=8)
     calibrate(model, [torch.randn(1, 3, 8, 8) for _ in range(2)], n_batches=2)
     assert model.training is True
 
 
-def test_collect_quant_modules_returns_only_stubs(ir_opts):
-    """With stubs-only activation Q, collect_quant_modules must return only QuantStub."""
+def test_collect_quant_modules_includes_convs_linears_stubs(ir_opts):
+    """collect_quant_modules duck-types on .act_observer — covers Conv, Linear, Stub."""
+    from affnet.modules.mobilenetv2 import InvertedResidual
+
     model = ToyIRNet(opts=ir_opts).eval()
     convert_model(
         model, weight_bits=8, act_bits=8,
         quantize_linear=True, insert_stubs=True,
+        stub_target_configs={InvertedResidual: StubConfig(bits=8, observer="min_max")},
     )
     qms = collect_quant_modules(model)
-    assert all(isinstance(m, QuantStub) for m in qms)
-    assert len(qms) == 2  # ir1.stub + ir2.stub (no QuantLinear act_observer)
+    n_convs = len(collect_quant_convs(model))
+    n_lins = len(collect_quant_linears(model))
+    n_stubs = len(collect_quant_stubs(model))
+    assert len(qms) == n_convs + n_lins + n_stubs
+    assert n_convs > 0 and n_lins == 1 and n_stubs == 2
 
 
-# -------- 16-bit math-sanity with stubs -------- #
+# -------- 16-bit math-sanity with full pipeline -------- #
 
 
-def test_16bit_with_stubs_near_fp32(ir_opts):
-    """PreStubbedModule + QuantLinear at 16-bit should be near FP32."""
+def test_16bit_full_pipeline_near_fp32(ir_opts):
+    """16-bit Conv act + Linear act + stubs should be near FP32."""
+    from affnet.modules.mobilenetv2 import InvertedResidual
+
     torch.manual_seed(11)
     model = ToyIRNet(opts=ir_opts).eval()
     x_cal = [torch.randn(4, 3, 16, 16) for _ in range(5)]
@@ -310,10 +429,10 @@ def test_16bit_with_stubs_near_fp32(ir_opts):
     convert_model(
         model, weight_bits=16, act_bits=16,
         quantize_linear=True, insert_stubs=True,
-        stub_observer="min_max", stub_bits=16,
-        weight_observer="min_max",
+        weight_observer="min_max", act_observer="min_max",
+        stub_target_configs={InvertedResidual: StubConfig(bits=16, observer="min_max")},
     )
     calibrate(model, x_cal, n_batches=5)
 
     max_err = (y_fp - model(x_test)).abs().max().item()
-    assert max_err < 5e-2, f"16/16 with stubs too divergent: max_err={max_err}"
+    assert max_err < 5e-2, f"16/16 with full pipeline too divergent: max_err={max_err}"

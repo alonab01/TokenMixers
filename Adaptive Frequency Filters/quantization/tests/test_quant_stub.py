@@ -5,7 +5,32 @@ import torch
 from torch import nn
 
 from quantization.observer import CALIBRATING, DISABLED, FROZEN
-from quantization.quant_stub import QuantStub, PreStubbedModule
+from quantization.quant_stub import QuantStub, PreStubbedModule, StubConfig
+
+
+# -------- StubConfig dataclass -------- #
+
+
+def test_stub_config_defaults():
+    cfg = StubConfig(bits=8)
+    assert cfg.bits == 8
+    assert cfg.observer == "percentile"
+    assert cfg.scheme == "asymmetric"
+
+
+def test_stub_config_overrides():
+    cfg = StubConfig(bits=4, observer="min_max", scheme="symmetric")
+    assert cfg.bits == 4
+    assert cfg.observer == "min_max"
+    assert cfg.scheme == "symmetric"
+
+
+def test_stub_config_is_hashable_and_frozen():
+    """frozen=True so configs can be used as dict values / sets."""
+    cfg = StubConfig(bits=8)
+    {cfg}  # hashable
+    with pytest.raises(Exception):
+        cfg.bits = 4  # frozen
 
 
 torch.manual_seed(0)

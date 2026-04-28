@@ -1,9 +1,10 @@
-"""QuantConv2d — wraps nn.Conv2d with weight-only fake-quantization.
+"""QuantConv2d — wraps nn.Conv2d with weight + activation fake-quantization.
 
 Weights: observed + frozen once in __init__ (static, no data needed).
-Activations: NOT quantized here. Activation quantization is handled exclusively
-by PreStubbedModule stubs placed at block inputs (hardware memory-read model).
-Bias stays FP32 (standard fake-quant convention).
+Activations: own act_observer per Conv. Calibrated alongside any other observers
+in the model via the standard CALIBRATING -> FROZEN state machine. Each Conv input
+gets its own scale, which is the standard PTQ shape and matches per-Conv hardware
+fusion. Bias stays FP32 (standard fake-quant convention).
 """
 from __future__ import annotations
 
@@ -28,6 +29,9 @@ class QuantConv2d(nn.Module):
         weight_bits: int,
         weight_observer: str = "min_max",
         weight_scheme: str = "symmetric",
+        act_bits: int = 8,
+        act_observer: str = "min_max",
+        act_scheme: str = "asymmetric",
     ):
         super().__init__()
         self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
@@ -42,12 +46,17 @@ class QuantConv2d(nn.Module):
         self.groups = groups
         self.padding_mode = padding_mode
         self.weight_bits = weight_bits
+        self.act_bits = act_bits
 
         self.weight_observer: BaseObserver = build_observer(
             weight_observer, bits=weight_bits, scheme=weight_scheme
         )
         self.weight_observer.observe(self.weight)
         self.weight_observer.freeze()
+
+        self.act_observer: BaseObserver = build_observer(
+            act_observer, bits=act_bits, scheme=act_scheme
+        )
 
     @classmethod
     def from_conv2d(cls, conv: nn.Conv2d, **quant_cfg) -> "QuantConv2d":
@@ -64,6 +73,7 @@ class QuantConv2d(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
+        x = self.act_observer(x)
         w_q = self.weight_observer.fake_quantize(self.weight)
         if self.padding_mode != "zeros":
             x = F.pad(x, self._reversed_padding_repeated_twice(), mode=self.padding_mode)
@@ -86,5 +96,5 @@ class QuantConv2d(nn.Module):
         return (
             f"in={self.weight.shape[1] * self.groups}, out={self.weight.shape[0]}, "
             f"k={tuple(self.weight.shape[-2:])}, stride={self.stride}, "
-            f"groups={self.groups}, w_bits={self.weight_bits}"
+            f"groups={self.groups}, w_bits={self.weight_bits}, a_bits={self.act_bits}"
         )

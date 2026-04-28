@@ -283,8 +283,9 @@ def arguments_quant(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Seed for the random subset of calibration images (reproducibility).",
     )
     group.add_argument(
-        "--quant.skip-modules", type=str, default="conv_1",
-        help="Comma-separated module-path prefixes kept at FP32 (e.g. 'conv_1,classifier').",
+        "--quant.skip-modules", type=str, default="",
+        help="Comma-separated module-path prefixes kept at FP32 (e.g. 'conv_1,classifier'). "
+             "Default empty: every Conv2d is quantized.",
     )
     group.add_argument(
         "--quant.weight-observer", type=str, default="min_max",
@@ -338,6 +339,31 @@ def arguments_quant(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument(
         "--quant.stub-bits", type=int, default=-1,
         help="Bit-width for QuantStubs. -1 falls back to --quant.activation-bits.",
+    )
+    group.add_argument(
+        "--quant.stub-targets", type=str, default="",
+        help="Comma-separated stub target short names from main_quant._STUB_TARGET_REGISTRY "
+             "(e.g. 'ln2d,afno2d,block,affblock'). Empty -> no stubs even if --quant.insert-stubs.",
+    )
+    group.add_argument(
+        "--quant.bias-correction", action="store_true",
+        help="Phase 6c: after calibration, run a pass capturing per-Conv input means and "
+             "shift each Conv/Linear bias by the expected output drift due to weight quant.",
+    )
+    group.add_argument(
+        "--quant.fold-bn", action="store_true",
+        help="Phase 7: fold BatchNorm/SyncBatchNorm into the preceding Conv2d weights+bias "
+             "before quantization. Default off (current Phase 1-6 behavior preserved). "
+             "Math: alpha=gamma/sqrt(var+eps); W'=alpha*W; b'=alpha*b+beta-mu*alpha. "
+             "BN is replaced with nn.Identity().",
+    )
+    group.add_argument(
+        "--quant.stub-config", type=str, default="",
+        help="Phase 7: per-target stub config override. Format: "
+             "'name=observer:bits:scheme,...' (bits/scheme optional). "
+             "Example: 'ln2d=min_max,afno2d=percentile:8:asymmetric'. "
+             "When empty, --quant.stub-targets is used and all targets share "
+             "--quant.stub-{observer,bits,scheme}.",
     )
     return parser
 
