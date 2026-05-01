@@ -163,3 +163,6 @@ Dataset_Root/
 */docs/
 */.claude/
 */results/
+
+/ImageNet/
+/imagenet/
