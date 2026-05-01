@@ -48,6 +48,23 @@ main_eval.py::main_worker
   → Evaluator(opts, model, loader).run()  [engine/evaluation_engine.py]
 ```
 
+## Best PTQ command (8/8 = 62.82% — Phase 6c reference)
+
+```bash
+python main_quant.py \
+  --common.config-file resource/config/imagenet_et/config.yaml \
+  --common.results-loc results/ \
+  --model.classification.pretrained resource/model/imagenet_et/checkpoint_ema_score_73.0238.pt \
+  --quant.enabled \
+  --quant.weight-bits 8 --quant.activation-bits 8 \
+  --quant.weight-observer per_channel_min_max \
+  --quant.act-observer percentile \
+  --quant.quantize-linear \
+  --quant.bias-correction
+```
+
+Add `--quant.fold-bn` for hardware-fidelity (Phase 7a — performance-neutral at 8/8 with per-channel weights, but matches real INT8 deployment which fuses Conv+BN). Add `--quant.insert-stubs --quant.stub-targets afno2d,affblock --quant.stub-observer min_max --quant.stub-bits 8 --quant.stub-scheme asymmetric` for the empirically "free" stub set (≈ 62.74% — the Phase 5 sweep showed `afno2d` and `affblock` are essentially free; `ln2d` and `block` cost more). Pre-wired in `.vscode/launch.json`.
+
 ---
 
 ## Architecture Reference (AFFNet-ET, 256×256)
@@ -189,6 +206,8 @@ Registered observers (`quantization/observer.py`):
 --quant.bias-correction      bool   default False     (Phase 6c — extra ~30s calib pass)
 --quant.fold-bn              bool   default False     (Phase 7 — Conv+SyncBN/BN -> fused Conv)
 --quant.stub-config          str    default ""        (Phase 7 — per-target stub override "ln2d=min_max,afno2d=percentile:8:asymmetric")
+--quant.quantize-acts        bool   default False     (Phase 8b — replace Swish/HardSwish with QuantHardswish; NEGATIVE result, see Phase 8b)
+--quant.skip-acts            str    default ""
 ```
 
 **Phase 5 stub target registry** (in `main_quant.py::_STUB_TARGET_REGISTRY`, keyed by short name):
@@ -200,21 +219,26 @@ Registered observers (`quantization/observer.py`):
 ### CSV layout
 
 - `results/quant_sweep.csv` — Phase 1/2 history (no QuantLinear, no stubs).
-- `results/quant_sweep_v2.csv` — Phase 3+ history (auto-routed when `--quant.quantize-linear` or `--quant.insert-stubs` is on).
+- `results/quant_sweep_v2.csv` — Phase 3+ history (auto-routed when `--quant.quantize-linear`, `--quant.insert-stubs`, or `--quant.quantize-acts` is on).
 
 ### Files
 
 ```
 quantization/
 ├── fake_quant.py        — fake_quantize(x, scale, zp, qmin, qmax)
-├── observer.py          — BaseObserver, MinMax/PerChannelMinMax/Percentile + OBSERVER_REGISTRY
+├── observer.py          — BaseObserver + 8 registered observers (per-tensor & per-channel
+│                          variants of {min_max, percentile, mse, histogram})
 ├── quant_conv.py        — QuantConv2d
 ├── quant_linear.py      — QuantLinear (refuses GroupLinear and channel_first=True)
 ├── quant_stub.py        — QuantStub, PreStubbedModule, StubConfig
-├── convert.py           — convert_model(...), _swap_conv2d, _swap_linears, _insert_stubs
+├── quant_hardswish.py   — QuantHardswish (Phase 8b — function swap + input quant in one)
+├── convert.py           — convert_model(...), _swap_conv2d, _swap_linears, _swap_acts, _insert_stubs
 ├── calibrate.py         — calibrate(...), collect_quant_modules (duck-typed on .act_observer)
-└── tests/               — pytest, 114 tests pass
-main_quant.py            — entry point; Phase 5 _STUB_TARGET_REGISTRY + _build_stub_targets
+├── bias_correction.py   — apply_bias_correction (Phase 6c)
+├── fuse.py              — fold_conv_bn_(model) (Phase 7a; deletes BN child after Phase 8a)
+└── tests/               — pytest
+main_quant.py            — entry point; _STUB_TARGET_REGISTRY + _build_stub_targets
+                          + _build_stub_targets_from_config (Phase 7c)
 ```
 
 ---
@@ -298,6 +322,61 @@ Stubs and BC stack additively to first order; the marginal stub cost matches the
 
 **Phase 6 takeaway:** Better observers don't help at low bit-widths on AFFNet, but **mathematical bias compensation** does. The 4-bit cliff requires AdaRound / QAT.
 
+### Phase 7 results (2026-04-30)
+
+**Phase 7a — Conv+BN folding (`--quant.fold-bn`):**
+
+Standard fusion: `α = γ/√(σ²+ε); W' = α·W; b' = α·b + β − μ·α`. BN child is deleted from its parent `Sequential` (Phase 8a refinement; was `nn.Identity()` placeholder originally). AFFNet-ET has 56 Conv→SyncBN pairs (every Conv layer has one). Folding happens BEFORE `convert_model` so the QuantConv2d quantizes the FOLDED weights as a single fused op.
+
+| Config | top-1 | Δ |
+|---|---|---|
+| FP32 no fold (T1) | 72.958 | (reference) |
+| FP32 + fold (T2) | 72.928 | -0.030 (= float-32 conv kernel noise — fold is mathematically lossless) |
+| 8/8 + BC, no fold (T3) | 62.816 | (matches Phase 6c reference 62.82) |
+| 8/8 + BC + fold (T4) | 62.766 | -0.050 vs T3 (= run-to-run noise) |
+
+**Conclusion:** **BN folding is performance-neutral at 8/8 with `per_channel_min_max` weights.** Reason: per-channel weight quant already gives each output channel its own scale, so multiplying weights by α before quantization just rescales each channel uniformly — the per-channel scale absorbs α perfectly. With per-tensor weight quant (`min_max`), folding *would* matter (untested but predicted to help significantly).
+
+**Why ship it anyway:** hardware fidelity. Real INT8 deployment (TensorRT/ONNX Runtime/TFLite) fuses Conv+BN automatically. Default off (preserves Phase 1–6 behavior).
+
+**Phase 7b — per-channel observers (`per_channel_percentile`, `per_channel_histogram`):**
+
+Registered, not yet swept. Available as `--quant.weight-observer per_channel_percentile` (sym/asym) and `--quant.weight-observer per_channel_histogram` (sym/asym, KL search vectorized across channels). Likely interesting at 4-bit weights where per-channel min/max wastes resolution on outliers.
+
+**Phase 7c — per-target stub config (`--quant.stub-config`):**
+
+Format: `name=observer[:bits[:scheme]],...` e.g. `ln2d=min_max,afno2d=histogram:8:asymmetric`. Lets you mix observers across stub targets instead of one global choice. Implemented; no sweep yet.
+
+### Phase 8 results (2026-05-01)
+
+**Phase 8a — drop the `nn.Identity` placeholder after BN folding:**
+
+`fold_conv_bn_` previously installed `nn.Identity()` in place of the folded BN to keep `Sequential` indices intact. With no caller depending on the placeholder (verified by grep across the repo), the BN child is now `del`'d outright. `Sequential.forward` iterates `_modules.values()` so removed entries are skipped cleanly; insertion order of the remaining children is preserved by the underlying `OrderedDict`. **Math-preserving cleanup; no eval impact** (synthetic test confirms output matches within float32 noise).
+
+**Phase 8b — `QuantHardswish` (function swap + activation-input quant fused) — NEGATIVE result:**
+
+New module `quantization/quant_hardswish.py` mirrors `QuantConv2d` / `QuantLinear`: own `act_observer` on its input, fake-quants the input, then runs `F.hardswish`. The convert pass (`_swap_acts` in `convert.py`, behind `--quant.quantize-acts`) replaces every `nn.SiLU` / `Swish` / `nn.Hardswish` / `Hardswish` site with `QuantHardswish` — bundling the function swap and the activation-input quantization into one transformation, matching real INT8 deployment where the Conv output is requantized before the nonlinearity reads it.
+
+**Site coverage on AFFNet-ET:** 55 sites (37 ConvLayer.act + 18 AFNO2D internal `act`/`act2`). Note: only 37 of 56 ConvLayers have an `act` submodule — the rest are `use_act=False`, so the earlier "56 ConvLayer.act" estimate was wrong.
+
+| # | Config | top-1 | Δ |
+|---|---|---|---|
+| R1 | FP32 Swish (reference) | 73.02 | — |
+| R2 | FP32 HardSwish (`--common.override-kwargs model.classification.activation.name=hard_swish`) | **35.17** | **−37.85 vs R1** (function swap alone in FP32) |
+| R3 | 8/8 + BC, Swish (Phase 6c reference) | 62.82 | — |
+| R4 | 8/8 + BC + `--quant.quantize-acts` | **0.42** | **−62.40 vs R3** |
+
+**Decomposition:** function swap costs 37.85pp in FP32 (R1 → R2); adding activation-input quant on top of the swapped HardSwish costs another ~34.75pp (R2 → R4). Both contributions are independently fatal.
+
+**Conclusion:** Replacing Swish with HardSwish on a Swish-trained model is not viable without retraining — the function-shape mismatch alone halves accuracy in FP32. The integrated swap is therefore not the right hardware-fidelity path to ship.
+
+**What this rules in/out for next steps:**
+- Activation-input quantization (alone) is *not* the killer here, but we never tested it on Swish (the integrated `QuantHardswish` bundles the swap). A separate `QuantSwish` (input-quant only, function unchanged) would isolate the input-quant cost on the right baseline. Open question — not yet wired.
+- HardSwish substitution is dead unless we retrain (out of scope per CLAUDE.md). Don't burn more compute on this branch.
+- The FP32-HardSwish loss is much larger than typical post-hoc activation swaps (literature suggests <5pp). Worth understanding *why* AFFNet is so sensitive — likely the AFNO2D spectral path's `act`/`act2` are the contributors (Swish smoothness around 0 may matter for the Hadamard-multiplied spectrum), but un-investigated.
+
+**Code shipped:** `quantization/quant_hardswish.py` + `_swap_acts` + `--quant.quantize-acts` / `--quant.skip-acts` + 8 unit tests + diagnostic in `main_quant.py`. Default OFF, so existing pipelines (Phases 1–7) are untouched.
+
 ### Phase 5 — FP32-boundary stub sweep (2026-04-27)
 
 Each row = Phase 4 8/8 baseline + `--quant.insert-stubs` with one (or more) target classes. `Δ` is vs Phase 4 baseline 59.38%.
@@ -329,18 +408,19 @@ Each row = Phase 4 8/8 baseline + `--quant.insert-stubs` with one (or more) targ
 
 ---
 
-## Phase 7 candidates (where to attack next)
+## Phase 8 candidates (where to attack next)
 
-Best 8/8 to date = **62.82%** (Phase 6c, bias correction). Gap to FP32 = 10.2pp. 4-bit configs still collapse.
+Best 8/8 to date = **62.82%** (Phase 6c, bias correction; fold-bn neutral at 8/8). Gap to FP32 = 10.2pp. 4-bit configs still collapse.
 
 Remaining levers, ordered by expected payoff vs effort:
 
 1. **AdaRound / BRECQ** — the standard answer to the 4-bit weight cliff. Learns rounding direction per weight via per-layer reconstruction loss. Requires a per-layer optimizer loop (~500 lines). Expected lift at 4/8: from ~0% to 50–60%.
-2. **`HistogramObserver` + KL-divergence** for activations — improves the activation-side scale by minimizing KL between FP and quantized histograms. May not help at 8/8 (we already have percentile + bias correction) but worth testing. Could matter at 8/4.
-3. **Combine BC with Phase 5 stubs** — bias correction compensates for weight-quant mean shift; stubs add quantized boundaries. Likely +1–2pp at 8/8 (model now closer to hardware fidelity).
-4. **SmoothQuant** — per-channel activation scaling absorbed into next layer's weights. Targets activation outliers explicitly. Useful if 8/4 or 4/4 are interesting; ~100 lines.
+2. **Sweep the new per-channel observers** (`per_channel_percentile`, `per_channel_histogram`) at 8/8 and 4/8. Cheap (~30 min compute, no new code). Phase 7b registered them but didn't run them.
+3. **SmoothQuant** — per-channel activation scaling absorbed into adjacent weights. Useful if 8/4 or 4/4 are interesting; ~100 lines.
+4. **Heterogeneous stub sweep via `--quant.stub-config`** — verify the global `min_max` stub-observer choice from Phase 5 is optimal across targets, or find tiny extra lift. Cheap.
 5. **Quantize AFNO2D `w1`/`w2`** — adds coverage to currently-FP32 spectral path. Tiny param count (20K), unclear marginal accuracy. Needs complex-aware observer + new `QuantEinsum` module.
 6. **Per-layer mixed precision** — sensitivity analysis to assign more bits to critical layers. Cheap diagnostic, then surgical bit-width assignment.
+7. **Per-tensor weight observer + fold-bn** — Phase 7a predicts folding would actually help here (per-tensor scale wastes resolution without folding because BN's α inflates some channels). Untested. Cheap A/B.
 
 ---
 

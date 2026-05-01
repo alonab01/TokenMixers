@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Type
 from torch import nn
 
 from quantization.quant_conv import QuantConv2d
+from quantization.quant_hardswish import QuantHardswish
 from quantization.quant_linear import QuantLinear
 from quantization.quant_stub import PreStubbedModule, QuantStub, StubConfig
 from utils import logger
@@ -61,6 +62,8 @@ def convert_model(
     skip_modules: Sequence[str] = (),
     quantize_linear: bool = False,
     skip_linears: Sequence[str] = (),
+    quantize_acts: bool = False,
+    skip_acts: Sequence[str] = (),
     insert_stubs: bool = False,
     skip_stubs: Sequence[str] = (),
     stub_target_configs: Optional[Dict[Type[nn.Module], StubConfig]] = None,
@@ -90,6 +93,9 @@ def convert_model(
 
     if quantize_linear:
         _swap_linears(model, quant_cfg, skip_linears)
+
+    if quantize_acts:
+        _swap_acts(model, quant_cfg, skip_acts)
 
     if insert_stubs:
         cfgs = stub_target_configs
@@ -162,6 +168,43 @@ def _swap_linears(
     swapped: List[str] = []
     for path, lin in targets:
         new = QuantLinear.from_linear(lin, **cfg)
+        parent, attr = _get_parent_and_attr(model, path)
+        _set_submodule(parent, attr, new)
+        swapped.append(path)
+    return swapped
+
+
+# ---------- Activation swap (Swish/HardSwish -> QuantHardswish) ---------- #
+
+
+def _swap_acts(
+    model: nn.Module,
+    cfg: dict,
+    skip_acts: Sequence[str],
+) -> List[str]:
+    """Replace every nn.SiLU / nn.Hardswish (and their AFFNet wrappers Swish /
+    Hardswish, which subclass them) with QuantHardswish — a function-swap +
+    activation-input quantization in one op. Models the int8 deployment story
+    where the Conv output is requantized before the nonlinearity reads it,
+    and the nonlinearity itself is the INT8-friendly HardSwish.
+    """
+    targets: List[Tuple[str, nn.Module]] = []
+    for path, module in model.named_modules():
+        if isinstance(module, QuantHardswish):
+            continue
+        if not isinstance(module, (nn.SiLU, nn.Hardswish)):
+            continue
+        if _is_skipped(path, skip_acts):
+            continue
+        targets.append((path, module))
+
+    swapped: List[str] = []
+    for path, _act in targets:
+        new = QuantHardswish(
+            act_bits=cfg["act_bits"],
+            act_observer=cfg["act_observer"],
+            act_scheme=cfg["act_scheme"],
+        )
         parent, attr = _get_parent_and_attr(model, path)
         _set_submodule(parent, attr, new)
         swapped.append(path)
@@ -256,3 +299,7 @@ def collect_quant_linears(model: nn.Module) -> List[QuantLinear]:
 
 def collect_quant_stubs(model: nn.Module) -> List[QuantStub]:
     return [m for m in model.modules() if isinstance(m, QuantStub)]
+
+
+def collect_quant_hardswish(model: nn.Module) -> List[QuantHardswish]:
+    return [m for m in model.modules() if isinstance(m, QuantHardswish)]

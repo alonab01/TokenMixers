@@ -1,9 +1,10 @@
 """Conv+BN folding for PTQ.
 
 Fuses an `nn.Conv2d` followed by `nn.BatchNorm2d`/`nn.SyncBatchNorm` (in eval mode,
-using running stats) into the Conv weights+bias, in-place. The BN is replaced with
-`nn.Identity()` so the model graph stays the same shape and downstream code does
-not need to know whether folding happened.
+using running stats) into the Conv weights+bias, in-place. The BN is then deleted
+from its parent `nn.Sequential` — `Sequential.forward` iterates `_modules.values()`,
+so a removed entry is simply skipped while the remaining children retain their
+insertion order.
 
 Math (per output channel c):
     alpha[c]   = gamma[c] / sqrt(running_var[c] + eps)
@@ -74,7 +75,7 @@ def _fold_pair(conv: nn.Conv2d, bn: nn.modules.batchnorm._BatchNorm) -> None:
 
 def fold_conv_bn_(model: nn.Module) -> int:
     """Walk `model`, fuse every (Conv2d, BN) adjacent pair found inside an
-    `nn.Sequential` container. Replaces the BN with `nn.Identity()` and returns
+    `nn.Sequential` container. Deletes the BN child after folding and returns
     the number of fused pairs.
 
     Targets `nn.BatchNorm2d` and `nn.SyncBatchNorm`. GroupNorm/LayerNorm/InstanceNorm
@@ -94,6 +95,6 @@ def fold_conv_bn_(model: nn.Module) -> int:
             name_b, mod_b = children[i + 1]
             if isinstance(mod_a, nn.Conv2d) and isinstance(mod_b, _BN_TYPES):
                 _fold_pair(mod_a, mod_b)
-                setattr(module, name_b, nn.Identity())
+                del module._modules[name_b]
                 n_fused += 1
     return n_fused

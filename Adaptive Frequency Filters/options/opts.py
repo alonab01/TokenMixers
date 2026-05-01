@@ -319,6 +319,17 @@ def arguments_quant(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Comma-separated module-path prefixes to keep FP32 when quantize-linear is on.",
     )
     group.add_argument(
+        "--quant.quantize-acts", action="store_true",
+        help="Replace every Swish (nn.SiLU) and HardSwish (nn.Hardswish) site with "
+             "QuantHardswish (function swap + activation-input quant in one op). "
+             "Models the int8 deployment path: Conv output is requantized before the "
+             "nonlinearity reads it, and the nonlinearity is the INT8-friendly HardSwish.",
+    )
+    group.add_argument(
+        "--quant.skip-acts", type=str, default="",
+        help="Comma-separated module-path prefixes to keep FP32 when quantize-acts is on.",
+    )
+    group.add_argument(
         "--quant.insert-stubs", action="store_true",
         help="Wrap block-boundary modules (IR/Block/AFFBlock/GlobalPool) with a QuantStub "
              "so output stays on the Q grid across blocks.",
@@ -355,7 +366,7 @@ def arguments_quant(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Phase 7: fold BatchNorm/SyncBatchNorm into the preceding Conv2d weights+bias "
              "before quantization. Default off (current Phase 1-6 behavior preserved). "
              "Math: alpha=gamma/sqrt(var+eps); W'=alpha*W; b'=alpha*b+beta-mu*alpha. "
-             "BN is replaced with nn.Identity().",
+             "The BN child is then deleted from its parent Sequential.",
     )
     group.add_argument(
         "--quant.stub-config", type=str, default="",
