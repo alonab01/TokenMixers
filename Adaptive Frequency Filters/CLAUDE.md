@@ -377,6 +377,24 @@ New module `quantization/quant_hardswish.py` mirrors `QuantConv2d` / `QuantLinea
 
 **Code shipped:** `quantization/quant_hardswish.py` + `_swap_acts` + `--quant.quantize-acts` / `--quant.skip-acts` + 8 unit tests + diagnostic in `main_quant.py`. Default OFF, so existing pipelines (Phases 1–7) are untouched.
 
+**Phase 8c — leaf-stub sweep (8/8 + BC + stubs on every leaf except Conv/BN/Linear) — NEGATIVE result:**
+
+Two new short names added to `_STUB_TARGET_REGISTRY` (`main_quant.py`):
+- `swish` → `Swish` (covers ConvLayer.act sites + AFNO2D internal `act`/`act2`)
+- `globalpool` → `GlobalPool` (the pre-classifier head)
+
+Run config: `--quant.insert-stubs --quant.stub-targets swish,ln2d,afno2d,globalpool --quant.stub-observer min_max --quant.stub-scheme asymmetric`. **86 stubs installed: 55 swish + 21 ln2d + 9 afno2d + 1 globalpool.**
+
+Result: **R5 = 3.63% top-1** (vs R3 = 62.82). −59pp from BC@8/8.
+
+**Why min_max ≠ right answer for Swish stubs:** Phase 5's "min_max dominates percentile for stubs" finding holds only for *post-norm/residual* tensors (tightly bounded). Swish-input stubs see *raw Conv output* (= post-BN-fold), which has wide range with outliers — the diagnostic showed `min_val` running averages spanning [-45, -5]. `min_max` lets outliers blow up the scale, coarsening the bulk. The right observer for Swish stubs is `percentile`. Phase 5's stub sweep included `block` (which sees post-residual, tightly bounded) but not `swish` directly, so this distinction wasn't visible until now.
+
+**Untested follow-up (~10 min compute):** Use Phase 7c per-target stub config:
+```
+--quant.stub-config swish=percentile,ln2d=min_max,afno2d=min_max,globalpool=min_max
+```
+Hypothesis: most of the −59pp lives in the 55 swish stubs; the other 31 (ln2d+afno2d+globalpool) cost roughly Phase 5 levels (≤2pp).
+
 ### Phase 5 — FP32-boundary stub sweep (2026-04-27)
 
 Each row = Phase 4 8/8 baseline + `--quant.insert-stubs` with one (or more) target classes. `Δ` is vs Phase 4 baseline 59.38%.

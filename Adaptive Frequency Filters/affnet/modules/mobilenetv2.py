@@ -11,6 +11,7 @@ from utils.math_utils import make_divisible
 from . import BaseModule, SqueezeExcitation
 from ..misc.profiler import module_profile
 from ..layers import ConvLayer, get_activation_fn
+from quantization.quant_skip_add import SkipAdd
 
 
 class InvertedResidualSE(BaseModule):
@@ -232,10 +233,12 @@ class InvertedResidual(BaseModule):
         self.use_res_connect = (
             self.stride == 1 and in_channels == out_channels and skip_connection
         )
+        if self.use_res_connect:
+            self.skip_add = SkipAdd()
 
     def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
         if self.use_res_connect:
-            return x + self.block(x)
+            return self.skip_add(self.block(x), x)
         else:
             return self.block(x)
 

@@ -20,6 +20,7 @@ from torch import nn
 from quantization.quant_conv import QuantConv2d
 from quantization.quant_hardswish import QuantHardswish
 from quantization.quant_linear import QuantLinear
+from quantization.quant_skip_add import QuantSkipAdd, SkipAdd
 from quantization.quant_stub import PreStubbedModule, QuantStub, StubConfig
 from utils import logger
 
@@ -64,6 +65,11 @@ def convert_model(
     skip_linears: Sequence[str] = (),
     quantize_acts: bool = False,
     skip_acts: Sequence[str] = (),
+    quantize_residuals: bool = False,
+    skip_residuals: Sequence[str] = (),
+    residual_observer: str = "min_max",
+    residual_scheme: str = "asymmetric",
+    residual_bits: Optional[int] = None,
     insert_stubs: bool = False,
     skip_stubs: Sequence[str] = (),
     stub_target_configs: Optional[Dict[Type[nn.Module], StubConfig]] = None,
@@ -96,6 +102,15 @@ def convert_model(
 
     if quantize_acts:
         _swap_acts(model, quant_cfg, skip_acts)
+
+    if quantize_residuals:
+        _swap_skip_adds(
+            model,
+            bits=residual_bits if residual_bits is not None else act_bits,
+            observer=residual_observer,
+            scheme=residual_scheme,
+            skip_residuals=skip_residuals,
+        )
 
     if insert_stubs:
         cfgs = stub_target_configs
@@ -211,6 +226,44 @@ def _swap_acts(
     return swapped
 
 
+# ---------- Residual-add swap (SkipAdd -> QuantSkipAdd) ---------- #
+
+
+def _swap_skip_adds(
+    model: nn.Module,
+    *,
+    bits: int,
+    observer: str,
+    scheme: str,
+    skip_residuals: Sequence[str],
+) -> List[str]:
+    """Replace every `SkipAdd` (the passthrough residual-add wrapper installed by
+    `Block.__init__` / `InvertedResidual.__init__`) with `QuantSkipAdd`, which
+    fake-quantizes each input branch with its own (s, z). The two branches are
+    independent — `stub_main` and `stub_skip` are distinct QuantStub instances.
+    Already-swapped sites (`QuantSkipAdd` is a SkipAdd subclass) are skipped.
+    """
+    targets: List[Tuple[str, SkipAdd]] = []
+    for path, module in model.named_modules():
+        if isinstance(module, QuantSkipAdd):
+            continue
+        if not isinstance(module, SkipAdd):
+            continue
+        if _is_skipped(path, skip_residuals):
+            continue
+        targets.append((path, module))
+
+    swapped: List[str] = []
+    for path, sa in targets:
+        new = QuantSkipAdd.from_skip_add(
+            sa, bits=bits, observer=observer, scheme=scheme
+        )
+        parent, attr = _get_parent_and_attr(model, path)
+        _set_submodule(parent, attr, new)
+        swapped.append(path)
+    return swapped
+
+
 # ---------- Stub insertion (per-type) ---------- #
 
 
@@ -248,7 +301,7 @@ def _insert_stubs(
     for path, module in model.named_modules():
         if path == "":
             continue
-        if isinstance(module, (PreStubbedModule, QuantStub, QuantConv2d, QuantLinear)):
+        if isinstance(module, (PreStubbedModule, QuantStub, QuantConv2d, QuantLinear, SkipAdd)):
             continue
         if _is_skipped(path, skip_stubs):
             continue
@@ -303,3 +356,7 @@ def collect_quant_stubs(model: nn.Module) -> List[QuantStub]:
 
 def collect_quant_hardswish(model: nn.Module) -> List[QuantHardswish]:
     return [m for m in model.modules() if isinstance(m, QuantHardswish)]
+
+
+def collect_quant_skip_adds(model: nn.Module) -> List[QuantSkipAdd]:
+    return [m for m in model.modules() if isinstance(m, QuantSkipAdd)]

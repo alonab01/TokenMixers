@@ -330,6 +330,31 @@ def arguments_quant(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Comma-separated module-path prefixes to keep FP32 when quantize-acts is on.",
     )
     group.add_argument(
+        "--quant.quantize-residuals", action="store_true",
+        help="Wrap every residual-add SkipAdd (Block post-filter add, InvertedResidual "
+             "skip-add) with QuantSkipAdd: each input branch is fake-quantized with its "
+             "own (s, z) before the adder. No output observer (the next Conv act_observer "
+             "or ln2d input stub already requantizes the sum).",
+    )
+    group.add_argument(
+        "--quant.skip-residuals", type=str, default="",
+        help="Comma-separated module-path prefixes to keep FP32 when quantize-residuals is on.",
+    )
+    group.add_argument(
+        "--quant.residual-observer", type=str, default="min_max",
+        help="Observer for the per-branch input stubs in QuantSkipAdd. Default min_max "
+             "(per Phase 5 finding for tightly-bounded post-norm/post-residual tensors).",
+    )
+    group.add_argument(
+        "--quant.residual-scheme", type=str, default="asymmetric",
+        choices=("symmetric", "asymmetric"),
+        help="Quant scheme for the per-branch input stubs.",
+    )
+    group.add_argument(
+        "--quant.residual-bits", type=int, default=-1,
+        help="Bit-width for the per-branch input stubs. -1 (default) reuses --quant.activation-bits.",
+    )
+    group.add_argument(
         "--quant.insert-stubs", action="store_true",
         help="Wrap block-boundary modules (IR/Block/AFFBlock/GlobalPool) with a QuantStub "
              "so output stays on the Q grid across blocks.",

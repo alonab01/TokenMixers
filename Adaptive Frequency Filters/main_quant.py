@@ -38,6 +38,7 @@ from quantization.convert import (
     collect_quant_hardswish,
     collect_quant_linears,
     collect_quant_modules,
+    collect_quant_skip_adds,
     collect_quant_stubs,
     convert_model,
 )
@@ -51,10 +52,13 @@ import importlib
 # String form "module:Class" is resolved lazily so we don't import affnet
 # modules at script import time (avoids circular-ish risks).
 _STUB_TARGET_REGISTRY: Dict[str, str] = {
-    "ln2d":     "affnet.layers.normalization.layer_norm:LayerNorm2D_NCHW",
-    "afno2d":   "affnet.modules.aff_block:AFNO2D_channelfirst",
-    "block":    "affnet.modules.aff_block:Block",
-    "affblock": "affnet.modules.aff_block:AFFBlock",
+    "ln2d":       "affnet.layers.normalization.layer_norm:LayerNorm2D_NCHW",
+    "afno2d":     "affnet.modules.aff_block:AFNO2D_channelfirst",
+    "block":      "affnet.modules.aff_block:Block",
+    "affblock":   "affnet.modules.aff_block:AFFBlock",
+    # Phase 8c: leaf-level targets (Swish/SiLU and the model's GlobalPool head).
+    "swish":      "affnet.layers.activation.swish:Swish",
+    "globalpool": "affnet.layers.global_pool:GlobalPool",
 }
 
 
@@ -261,10 +265,17 @@ def main(opts, **kwargs):
     quantize_linear = bool(getattr(opts, "quant.quantize_linear", False))
     insert_stubs = bool(getattr(opts, "quant.insert_stubs", False))
     quantize_acts = bool(getattr(opts, "quant.quantize_acts", False))
+    quantize_residuals = bool(getattr(opts, "quant.quantize_residuals", False))
     skip_linears_str = getattr(opts, "quant.skip_linears", "")
     skip_linears = [s.strip() for s in skip_linears_str.split(",") if s.strip()]
     skip_acts_str = getattr(opts, "quant.skip_acts", "")
     skip_acts = [s.strip() for s in skip_acts_str.split(",") if s.strip()]
+    skip_residuals_str = getattr(opts, "quant.skip_residuals", "")
+    skip_residuals = [s.strip() for s in skip_residuals_str.split(",") if s.strip()]
+    residual_observer = getattr(opts, "quant.residual_observer", "min_max")
+    residual_scheme = getattr(opts, "quant.residual_scheme", "asymmetric")
+    residual_bits_arg = int(getattr(opts, "quant.residual_bits", -1))
+    residual_bits = residual_bits_arg if residual_bits_arg > 0 else a_bits
     skip_stubs_str = getattr(opts, "quant.skip_stubs", "")
     skip_stubs = [s.strip() for s in skip_stubs_str.split(",") if s.strip()]
     stub_observer = getattr(opts, "quant.stub_observer", "percentile")
@@ -293,11 +304,16 @@ def main(opts, **kwargs):
     if is_master_node:
         logger.log(
             "[quant] Converting: Conv2d->QuantConv2d "
-            "(w={}b, a={}b, skip={}) linear={} acts={} stubs={} stub_bits={} stub_obs={}".format(
+            "(w={}b, a={}b, skip={}) linear={} acts={} residuals={} stubs={} stub_bits={} stub_obs={}".format(
                 w_bits, a_bits, skip_list, quantize_linear, quantize_acts,
-                insert_stubs, stub_bits, stub_observer,
+                quantize_residuals, insert_stubs, stub_bits, stub_observer,
             )
         )
+        if quantize_residuals:
+            logger.log(
+                f"[quant] residual stubs: bits={residual_bits} "
+                f"observer={residual_observer} scheme={residual_scheme}"
+            )
         if stub_config_csv.strip():
             logger.log(
                 f"[quant] stub-config = '{stub_config_csv}' "
@@ -321,6 +337,11 @@ def main(opts, **kwargs):
         skip_linears=skip_linears,
         quantize_acts=quantize_acts,
         skip_acts=skip_acts,
+        quantize_residuals=quantize_residuals,
+        skip_residuals=skip_residuals,
+        residual_observer=residual_observer,
+        residual_scheme=residual_scheme,
+        residual_bits=residual_bits,
         insert_stubs=insert_stubs,
         skip_stubs=skip_stubs,
         stub_target_configs=stub_target_configs if stub_target_configs else None,
@@ -333,10 +354,12 @@ def main(opts, **kwargs):
     n_qlinears = len(collect_quant_linears(model))
     n_qstubs = len(collect_quant_stubs(model))
     n_qacts = len(collect_quant_hardswish(model))
+    n_qskip_adds = len(collect_quant_skip_adds(model))
     if is_master_node:
         logger.log(
             f"[quant] Installed: {n_qconvs} QuantConv2d, "
-            f"{n_qlinears} QuantLinear, {n_qacts} QuantHardswish, {n_qstubs} QuantStub"
+            f"{n_qlinears} QuantLinear, {n_qacts} QuantHardswish, "
+            f"{n_qskip_adds} QuantSkipAdd, {n_qstubs} QuantStub"
         )
 
     # ---- calibrate ---- #
@@ -390,10 +413,12 @@ def main(opts, **kwargs):
         qcs_all = collect_quant_convs(model)
         qls_all = collect_quant_linears(model)
         qhs_all = collect_quant_hardswish(model)
+        qsas_all = collect_quant_skip_adds(model)
         qss_all = collect_quant_stubs(model)
         logger.log(
             f"[quant-diag] {len(qcs_all)} QuantConv2d, {len(qls_all)} QuantLinear, "
-            f"{len(qhs_all)} QuantHardswish, {len(qss_all)} QuantStub"
+            f"{len(qhs_all)} QuantHardswish, {len(qsas_all)} QuantSkipAdd, "
+            f"{len(qss_all)} QuantStub"
         )
 
         def _scalar_range(t):
@@ -437,6 +462,19 @@ def main(opts, **kwargs):
                     _scalar(a_ob.scale), int(_scalar(a_ob.zero_point)),
                 )
             )
+        for i, qsa in enumerate(qsas_all):
+            sm, ss = qsa.stub_main.act_observer, qsa.stub_skip.act_observer
+            sm_min, sm_max = _scalar_range(getattr(sm, "min_val", None))
+            ss_min, ss_max = _scalar_range(getattr(ss, "min_val", None))
+            logger.log(
+                "  qskipadd[{:2d}] main:[{:+.3f},{:+.3f}] mscale={:.2e} mzp={:3d}  "
+                "skip:[{:+.3f},{:+.3f}] sscale={:.2e} szp={:3d}".format(
+                    i, sm_min, sm_max,
+                    _scalar(sm.scale), int(_scalar(sm.zero_point)),
+                    ss_min, ss_max,
+                    _scalar(ss.scale), int(_scalar(ss.zero_point)),
+                )
+            )
         for i, qs in enumerate(qss_all):
             a_ob = qs.act_observer
             a_min, a_max = _scalar_range(getattr(a_ob, "min_val", None))
@@ -455,7 +493,7 @@ def main(opts, **kwargs):
     if is_master_node:
         # Phase 3 features write to v2 by default so Phase 1/2 sweep history isn't mutated.
         user_csv = getattr(opts, "quant.results_csv", "results/quant_sweep.csv")
-        if (quantize_linear or insert_stubs or quantize_acts) and user_csv == "results/quant_sweep.csv":
+        if (quantize_linear or insert_stubs or quantize_acts or quantize_residuals) and user_csv == "results/quant_sweep.csv":
             csv_path = "results/quant_sweep_v2.csv"
         else:
             csv_path = user_csv
@@ -472,6 +510,9 @@ def main(opts, **kwargs):
             "a_scheme": getattr(opts, "quant.act_scheme", "asymmetric"),
             "quantize_linear": quantize_linear,
             "quantize_acts": quantize_acts,
+            "quantize_residuals": quantize_residuals,
+            "residual_observer": residual_observer if quantize_residuals else "",
+            "residual_bits": residual_bits if quantize_residuals else -1,
             "insert_stubs": insert_stubs,
             "stub_targets": stub_targets_csv if insert_stubs else "",
             "stub_config": stub_config_csv if insert_stubs else "",
@@ -481,6 +522,7 @@ def main(opts, **kwargs):
             "n_quant_convs": n_qconvs,
             "n_quant_linears": n_qlinears,
             "n_quant_hardswish": n_qacts,
+            "n_quant_skip_adds": n_qskip_adds,
             "n_quant_stubs": n_qstubs,
             "skip_modules": skip_str,
             "model_ckpt": os.path.basename(
