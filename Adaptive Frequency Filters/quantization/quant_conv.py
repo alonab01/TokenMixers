@@ -49,13 +49,14 @@ class QuantConv2d(nn.Module):
         self.act_bits = act_bits
 
         self.weight_observer: BaseObserver = build_observer(
-            weight_observer, bits=weight_bits, scheme=weight_scheme
+            weight_observer, bits=weight_bits, scheme=weight_scheme, axis=0,
         )
         self.weight_observer.observe(self.weight)
         self.weight_observer.freeze()
 
+        # Conv activations are NCHW: channel axis = 1.
         self.act_observer: BaseObserver = build_observer(
-            act_observer, bits=act_bits, scheme=act_scheme
+            act_observer, bits=act_bits, scheme=act_scheme, axis=1,
         )
 
     @classmethod

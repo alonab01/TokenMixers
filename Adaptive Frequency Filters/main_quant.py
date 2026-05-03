@@ -427,7 +427,11 @@ def main(opts, **kwargs):
             return t.min().item(), t.max().item()
 
         def _scalar(t):
-            return t.mean().item() if t.numel() > 1 else t.item()
+            # Per-channel observers can have Long zero_point of length > 1; cast to
+            # float before mean() to avoid "could not infer output dtype" on Long.
+            if t.numel() > 1:
+                return t.to(torch.float32).mean().item()
+            return t.item()
 
         for i, qc in enumerate(qcs_all):
             w_ob, a_ob = qc.weight_observer, qc.act_observer

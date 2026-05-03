@@ -40,8 +40,12 @@ class QuantStub(nn.Module):
     ):
         super().__init__()
         self.act_bits = act_bits
+        # Stubs in this codebase only wrap modules that consume NCHW activations
+        # (LayerNorm2D, AFNO2D, Block, AFFBlock, Swish, GlobalPool — all work on
+        # 4-D channel-first tensors), so axis=1 is the right per-channel axis.
+        # Per-tensor observers ignore the axis kwarg.
         self.act_observer: BaseObserver = build_observer(
-            act_observer, bits=act_bits, scheme=act_scheme
+            act_observer, bits=act_bits, scheme=act_scheme, axis=1,
         )
 
     def forward(self, x: Tensor) -> Tensor:

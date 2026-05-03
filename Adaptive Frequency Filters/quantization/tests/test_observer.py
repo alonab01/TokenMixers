@@ -334,11 +334,12 @@ def test_mse_registered():
     assert "per_channel_mse" in OBSERVER_REGISTRY
 
 
-def test_mse_rejects_asymmetric():
-    with pytest.raises(ValueError, match="symmetric"):
-        MSEObserver(bits=8, scheme=ASYMMETRIC)
-    with pytest.raises(ValueError, match="symmetric"):
-        PerChannelMSEObserver(bits=8, scheme=ASYMMETRIC)
+def test_mse_accepts_both_schemes():
+    """Phase 9: MSE observers are now histogram-backed and accept asymmetric too."""
+    MSEObserver(bits=8, scheme=ASYMMETRIC)
+    PerChannelMSEObserver(bits=8, scheme=ASYMMETRIC)
+    MSEObserver(bits=8, scheme=SYMMETRIC)
+    PerChannelMSEObserver(bits=8, scheme=SYMMETRIC)
 
 
 def test_mse_observer_workflow():
