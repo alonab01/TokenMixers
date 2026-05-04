@@ -276,6 +276,8 @@ def main(opts, **kwargs):
     residual_scheme = getattr(opts, "quant.residual_scheme", "asymmetric")
     residual_bits_arg = int(getattr(opts, "quant.residual_bits", -1))
     residual_bits = residual_bits_arg if residual_bits_arg > 0 else a_bits
+    residual_main_observer = getattr(opts, "quant.residual_main_observer", "") or None
+    residual_skip_observer = getattr(opts, "quant.residual_skip_observer", "") or None
     skip_stubs_str = getattr(opts, "quant.skip_stubs", "")
     skip_stubs = [s.strip() for s in skip_stubs_str.split(",") if s.strip()]
     stub_observer = getattr(opts, "quant.stub_observer", "percentile")
@@ -342,6 +344,8 @@ def main(opts, **kwargs):
         residual_observer=residual_observer,
         residual_scheme=residual_scheme,
         residual_bits=residual_bits,
+        residual_main_observer=residual_main_observer,
+        residual_skip_observer=residual_skip_observer,
         insert_stubs=insert_stubs,
         skip_stubs=skip_stubs,
         stub_target_configs=stub_target_configs if stub_target_configs else None,
@@ -533,6 +537,12 @@ def main(opts, **kwargs):
                 getattr(opts, "model.classification.pretrained", "") or ""
             ),
         }
+        # Add residual main/skip observer columns ONLY when residuals are quantized.
+        # This keeps the column shape identical to pre-Phase-9 CSVs for runs that
+        # don't touch QuantSkipAdd, so old CSVs aren't broken by appending new rows.
+        if quantize_residuals:
+            row["residual_main_observer"] = residual_main_observer or residual_observer
+            row["residual_skip_observer"] = residual_skip_observer or residual_observer
         for name, val in (evaluator.final_metrics or {}).items():
             row[name] = round(val, 4)
         _log_csv_row(csv_path, row)

@@ -70,6 +70,8 @@ def convert_model(
     residual_observer: str = "min_max",
     residual_scheme: str = "asymmetric",
     residual_bits: Optional[int] = None,
+    residual_main_observer: str = None,
+    residual_skip_observer: str = None,
     insert_stubs: bool = False,
     skip_stubs: Sequence[str] = (),
     stub_target_configs: Optional[Dict[Type[nn.Module], StubConfig]] = None,
@@ -110,6 +112,8 @@ def convert_model(
             observer=residual_observer,
             scheme=residual_scheme,
             skip_residuals=skip_residuals,
+            main_observer=residual_main_observer,
+            skip_observer=residual_skip_observer,
         )
 
     if insert_stubs:
@@ -236,11 +240,15 @@ def _swap_skip_adds(
     observer: str,
     scheme: str,
     skip_residuals: Sequence[str],
+    main_observer: str = None,
+    skip_observer: str = None,
 ) -> List[str]:
     """Replace every `SkipAdd` (the passthrough residual-add wrapper installed by
     `Block.__init__` / `InvertedResidual.__init__`) with `QuantSkipAdd`, which
     fake-quantizes each input branch with its own (s, z). The two branches are
     independent — `stub_main` and `stub_skip` are distinct QuantStub instances.
+    `main_observer` / `skip_observer` (if given) override the default `observer`
+    for that branch only — used by the residual main-x-skip 8x8 sweep.
     Already-swapped sites (`QuantSkipAdd` is a SkipAdd subclass) are skipped.
     """
     targets: List[Tuple[str, SkipAdd]] = []
@@ -256,7 +264,8 @@ def _swap_skip_adds(
     swapped: List[str] = []
     for path, sa in targets:
         new = QuantSkipAdd.from_skip_add(
-            sa, bits=bits, observer=observer, scheme=scheme
+            sa, bits=bits, observer=observer, scheme=scheme,
+            main_observer=main_observer, skip_observer=skip_observer,
         )
         parent, attr = _get_parent_and_attr(model, path)
         _set_submodule(parent, attr, new)

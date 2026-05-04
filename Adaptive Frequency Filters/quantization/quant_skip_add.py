@@ -53,12 +53,18 @@ class QuantSkipAdd(SkipAdd):
         bits: int,
         observer: str,
         scheme: str,
+        main_observer: str = None,
+        skip_observer: str = None,
     ) -> "QuantSkipAdd":
         """Build a QuantSkipAdd carrying two independent QuantStub instances.
 
-        Each stub gets its own observer object — they accumulate and freeze
-        independently, so `s_main` and `s_skip` are NOT shared.
+        `observer` is the default for both branches; `main_observer` /
+        `skip_observer` override per branch (Phase-9 sweep). Each stub gets its
+        own observer object — they accumulate and freeze independently, so
+        `s_main` and `s_skip` are NOT shared.
         """
-        stub_main = QuantStub(act_bits=bits, act_observer=observer, act_scheme=scheme)
-        stub_skip = QuantStub(act_bits=bits, act_observer=observer, act_scheme=scheme)
+        m_obs = main_observer or observer
+        s_obs = skip_observer or observer
+        stub_main = QuantStub(act_bits=bits, act_observer=m_obs, act_scheme=scheme)
+        stub_skip = QuantStub(act_bits=bits, act_observer=s_obs, act_scheme=scheme)
         return cls(stub_main=stub_main, stub_skip=stub_skip)

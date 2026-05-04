@@ -355,6 +355,16 @@ def arguments_quant(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Bit-width for the per-branch input stubs. -1 (default) reuses --quant.activation-bits.",
     )
     group.add_argument(
+        "--quant.residual-main-observer", type=str, default="",
+        help="Override observer for the MAIN branch of QuantSkipAdd. "
+             "Empty (default) uses --quant.residual-observer for both branches.",
+    )
+    group.add_argument(
+        "--quant.residual-skip-observer", type=str, default="",
+        help="Override observer for the SKIP branch of QuantSkipAdd. "
+             "Empty (default) uses --quant.residual-observer for both branches.",
+    )
+    group.add_argument(
         "--quant.insert-stubs", action="store_true",
         help="Wrap block-boundary modules (IR/Block/AFFBlock/GlobalPool) with a QuantStub "
              "so output stays on the Q grid across blocks.",
