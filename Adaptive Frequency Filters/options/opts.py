@@ -254,6 +254,166 @@ def arguments_ddp(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def arguments_quant(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    group = parser.add_argument_group(
+        title="Quantization arguments", description="Post-training fake-quant simulation"
+    )
+    group.add_argument(
+        "--quant.enabled", action="store_true",
+        help="Enable PTQ fake-quantization. Required for main_quant.py.",
+    )
+    group.add_argument(
+        "--quant.weight-bits", type=int, default=8,
+        help="Bit-width for Conv2d weights (Phase 1 default: 8).",
+    )
+    group.add_argument(
+        "--quant.activation-bits", type=int, default=8,
+        help="Bit-width for Conv2d input activations (Phase 1 default: 8).",
+    )
+    group.add_argument(
+        "--quant.calib-size", type=int, default=512,
+        help="Number of calibration images (drawn from ImageNet val, shuffled).",
+    )
+    group.add_argument(
+        "--quant.calib-batch-size", type=int, default=32,
+        help="Batch size during the calibration pass.",
+    )
+    group.add_argument(
+        "--quant.calib-seed", type=int, default=0,
+        help="Seed for the random subset of calibration images (reproducibility).",
+    )
+    group.add_argument(
+        "--quant.skip-modules", type=str, default="",
+        help="Comma-separated module-path prefixes kept at FP32 (e.g. 'conv_1,classifier'). "
+             "Default empty: every Conv2d is quantized.",
+    )
+    group.add_argument(
+        "--quant.weight-observer", type=str, default="min_max",
+        help="Weight observer (OBSERVER_REGISTRY key). Phase 2: per_channel_min_max, mse, ...",
+    )
+    group.add_argument(
+        "--quant.act-observer", type=str, default="min_max",
+        help="Activation observer (OBSERVER_REGISTRY key). Phase 2: percentile, histogram, ...",
+    )
+    group.add_argument(
+        "--quant.weight-scheme", type=str, default="symmetric",
+        choices=["symmetric", "asymmetric"],
+        help="Symmetric weight quant (standard) or asymmetric.",
+    )
+    group.add_argument(
+        "--quant.act-scheme", type=str, default="asymmetric",
+        choices=["symmetric", "asymmetric"],
+        help="Asymmetric activation quant (handles one-sided post-ReLU dists) or symmetric.",
+    )
+    group.add_argument(
+        "--quant.results-csv", type=str, default="results/quant_sweep.csv",
+        help="CSV path appended with one row per run (w_bits,a_bits,top1,...).",
+    )
+    # Phase 3: hardware-faithful simulation (all default OFF to preserve Phase 2 reproducibility)
+    group.add_argument(
+        "--quant.quantize-linear", action="store_true",
+        help="Also swap nn.Linear / LinearLayer -> QuantLinear (classifier head).",
+    )
+    group.add_argument(
+        "--quant.skip-linears", type=str, default="",
+        help="Comma-separated module-path prefixes to keep FP32 when quantize-linear is on.",
+    )
+    group.add_argument(
+        "--quant.quantize-acts", action="store_true",
+        help="Replace every Swish (nn.SiLU) and HardSwish (nn.Hardswish) site with "
+             "QuantHardswish (function swap + activation-input quant in one op). "
+             "Models the int8 deployment path: Conv output is requantized before the "
+             "nonlinearity reads it, and the nonlinearity is the INT8-friendly HardSwish.",
+    )
+    group.add_argument(
+        "--quant.skip-acts", type=str, default="",
+        help="Comma-separated module-path prefixes to keep FP32 when quantize-acts is on.",
+    )
+    group.add_argument(
+        "--quant.quantize-residuals", action="store_true",
+        help="Wrap every residual-add SkipAdd (Block post-filter add, InvertedResidual "
+             "skip-add) with QuantSkipAdd: each input branch is fake-quantized with its "
+             "own (s, z) before the adder. No output observer (the next Conv act_observer "
+             "or ln2d input stub already requantizes the sum).",
+    )
+    group.add_argument(
+        "--quant.skip-residuals", type=str, default="",
+        help="Comma-separated module-path prefixes to keep FP32 when quantize-residuals is on.",
+    )
+    group.add_argument(
+        "--quant.residual-observer", type=str, default="min_max",
+        help="Observer for the per-branch input stubs in QuantSkipAdd. Default min_max "
+             "(per Phase 5 finding for tightly-bounded post-norm/post-residual tensors).",
+    )
+    group.add_argument(
+        "--quant.residual-scheme", type=str, default="asymmetric",
+        choices=("symmetric", "asymmetric"),
+        help="Quant scheme for the per-branch input stubs.",
+    )
+    group.add_argument(
+        "--quant.residual-bits", type=int, default=-1,
+        help="Bit-width for the per-branch input stubs. -1 (default) reuses --quant.activation-bits.",
+    )
+    group.add_argument(
+        "--quant.residual-main-observer", type=str, default="",
+        help="Override observer for the MAIN branch of QuantSkipAdd. "
+             "Empty (default) uses --quant.residual-observer for both branches.",
+    )
+    group.add_argument(
+        "--quant.residual-skip-observer", type=str, default="",
+        help="Override observer for the SKIP branch of QuantSkipAdd. "
+             "Empty (default) uses --quant.residual-observer for both branches.",
+    )
+    group.add_argument(
+        "--quant.insert-stubs", action="store_true",
+        help="Wrap block-boundary modules (IR/Block/AFFBlock/GlobalPool) with a QuantStub "
+             "so output stays on the Q grid across blocks.",
+    )
+    group.add_argument(
+        "--quant.skip-stubs", type=str, default="",
+        help="Comma-separated module-path prefixes excluded from stub insertion.",
+    )
+    group.add_argument(
+        "--quant.stub-observer", type=str, default="percentile",
+        help="Observer used for QuantStubs (OBSERVER_REGISTRY key).",
+    )
+    group.add_argument(
+        "--quant.stub-scheme", type=str, default="asymmetric",
+        choices=["symmetric", "asymmetric"],
+        help="Quantization scheme for QuantStubs.",
+    )
+    group.add_argument(
+        "--quant.stub-bits", type=int, default=-1,
+        help="Bit-width for QuantStubs. -1 falls back to --quant.activation-bits.",
+    )
+    group.add_argument(
+        "--quant.stub-targets", type=str, default="",
+        help="Comma-separated stub target short names from main_quant._STUB_TARGET_REGISTRY "
+             "(e.g. 'ln2d,afno2d,block,affblock'). Empty -> no stubs even if --quant.insert-stubs.",
+    )
+    group.add_argument(
+        "--quant.bias-correction", action="store_true",
+        help="Phase 6c: after calibration, run a pass capturing per-Conv input means and "
+             "shift each Conv/Linear bias by the expected output drift due to weight quant.",
+    )
+    group.add_argument(
+        "--quant.fold-bn", action="store_true",
+        help="Phase 7: fold BatchNorm/SyncBatchNorm into the preceding Conv2d weights+bias "
+             "before quantization. Default off (current Phase 1-6 behavior preserved). "
+             "Math: alpha=gamma/sqrt(var+eps); W'=alpha*W; b'=alpha*b+beta-mu*alpha. "
+             "The BN child is then deleted from its parent Sequential.",
+    )
+    group.add_argument(
+        "--quant.stub-config", type=str, default="",
+        help="Phase 7: per-target stub config override. Format: "
+             "'name=observer:bits:scheme,...' (bits/scheme optional). "
+             "Example: 'ln2d=min_max,afno2d=percentile:8:asymmetric'. "
+             "When empty, --quant.stub-targets is used and all targets share "
+             "--quant.stub-{observer,bits,scheme}.",
+    )
+    return parser
+
+
 def parser_to_opts(parser: argparse.ArgumentParser):
     # parse args
     opts = parser.parse_args()
@@ -295,6 +455,9 @@ def get_training_arguments(parse_args: Optional[bool] = True):
 
     # common
     parser = arguments_common(parser=parser)
+
+    # quantization (PTQ — used by main_quant.py)
+    parser = arguments_quant(parser=parser)
 
     # wandb
     parser.add_argument('--log-wandb', action='store_true', default=False,

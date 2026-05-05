@@ -14,6 +14,7 @@ from . import InvertedResidual
 from .base_module import BaseModule
 from ..misc.profiler import module_profile
 from ..layers import ConvLayer, get_normalization_layer, get_activation_fn
+from quantization.quant_skip_add import SkipAdd
 import typing
 from typing import Any, List
 from einops.layers.torch import Rearrange
@@ -291,6 +292,7 @@ class Block(nn.Module):
             expand_ratio=mlp_ratio,
         )
         self.double_skip = double_skip
+        self.skip_add = SkipAdd()
 
     def forward(self, x):
         residual = x
@@ -306,7 +308,7 @@ class Block(nn.Module):
         # x = self.mlp(x)
         x = self.filter(x)
         x = self.drop_path(x)
-        x = x + residual
+        x = self.skip_add(x, residual)
         return x
 
     def profile_module(
